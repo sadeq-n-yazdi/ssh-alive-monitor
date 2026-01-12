@@ -23,12 +23,15 @@ type AuthManager struct {
 	mu   sync.RWMutex
 }
 
-func NewAuthManager(masterKeys []string) *AuthManager {
+func NewAuthManager(config *Config) *AuthManager {
 	am := &AuthManager{
 		Keys: make(map[string]APIKey),
 	}
-	for _, k := range masterKeys {
+	for _, k := range config.MasterKeys {
 		am.Keys[k] = APIKey{Key: k, Type: KeyMaster, Enabled: true}
+	}
+	for _, k := range config.NormalKeys {
+		am.Keys[k] = APIKey{Key: k, Type: KeyNormal, Enabled: true}
 	}
 	return am
 }
@@ -47,6 +50,18 @@ func (am *AuthManager) AddKey(key string, kType APIKeyType) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	am.Keys[key] = APIKey{Key: key, Type: kType, Enabled: true}
+}
+
+func (am *AuthManager) GetKeysByType(kType APIKeyType) []string {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	var keys []string
+	for k, v := range am.Keys {
+		if v.Type == kType {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 func (am *AuthManager) DeleteKey(key string) {

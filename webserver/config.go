@@ -14,6 +14,7 @@ type Config struct {
 	DefaultInterval string   `json:"default_interval"`
 	DefaultTimeout  string   `json:"default_timeout"`
 	MasterKeys      []string `json:"master_keys"`
+	NormalKeys      []string `json:"normal_keys"`
 	PredefinedHosts []string `json:"predefined_hosts"`
 	IPWhitelist     []string `json:"ip_whitelist"`
 }
@@ -29,6 +30,18 @@ func loadConfig(path string, config *Config) error {
 	defer file.Close()
 
 	return json.NewDecoder(file).Decode(config)
+}
+
+func (c *Config) Save(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "    ")
+	return encoder.Encode(c)
 }
 
 func GetConfig() *Config {

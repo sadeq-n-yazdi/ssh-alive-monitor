@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -38,7 +40,7 @@ func main() {
 		logger.Components[c] = true
 	}
 
-	auth := NewAuthManager(cfg.MasterKeys)
+	auth := NewAuthManager(cfg)
 	monitor := NewMonitor(logger)
 
 	// Add predefined hosts
@@ -135,13 +137,19 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var req struct {
-			Key  string     `json:"key"`
-			Type APIKeyType `json:"type"`
+			Key      string     `json:"key"`
+			Type     APIKeyType `json:"type"`
+			Generate bool       `json:"generate"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		if req.Generate {
+			req.Key = generateRandomKey(32)
+		}
+
 		if req.Key == "" {
 			http.Error(w, "Key is required", http.StatusBadRequest)
 			return
@@ -150,7 +158,13 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 			req.Type = KeyNormal
 		}
 		s.auth.AddKey(req.Key, req.Type)
-		s.respond(w, r, map[string]string{"message": "Key added"})
+
+		// Sync to config
+		s.config.MasterKeys = s.auth.GetKeysByType(KeyMaster)
+		s.config.NormalKeys = s.auth.GetKeysByType(KeyNormal)
+		s.config.Save("config.json")
+
+		s.respond(w, r, map[string]string{"message": "Key added", "key": req.Key})
 
 	case http.MethodDelete:
 		key := r.URL.Query().Get("key")
@@ -159,6 +173,12 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.auth.DeleteKey(key)
+
+		// Sync to config
+		s.config.MasterKeys = s.auth.GetKeysByType(KeyMaster)
+		s.config.NormalKeys = s.auth.GetKeysByType(KeyNormal)
+		s.config.Save("config.json")
+
 		s.respond(w, r, map[string]string{"message": "Key deleted"})
 
 	case http.MethodPatch:
@@ -232,6 +252,43 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 		host := normalizeTarget(req.Host)
 		s.monitor.AddHost(host, interval, timeout, false)
 		s.respond(w, r, map[string]string{"message": "Host added", "host": host})
+
+	case http.MethodPut:
+		var req struct {
+			Host     string `json:"host"`
+			Interval string `json:"interval"`
+			Timeout  string `json:"timeout"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Host == "" {
+			http.Error(w, "Host is required", http.StatusBadRequest)
+			return
+		}
+
+		interval, _ := time.ParseDuration(req.Interval)
+		if interval == 0 {
+			interval, _ = time.ParseDuration(s.config.DefaultInterval)
+		}
+		timeout, _ := time.ParseDuration(req.Timeout)
+		if timeout == 0 {
+			timeout, _ = time.ParseDuration(s.config.DefaultTimeout)
+		}
+
+		host := normalizeTarget(req.Host)
+		s.monitor.mu.Lock()
+		if h, ok := s.monitor.Hosts[host]; ok {
+			h.Interval = interval
+			h.Timeout = timeout
+			s.logger.Info("checks", "Updated host: %s (interval: %v, timeout: %v)", host, interval, timeout)
+			s.monitor.mu.Unlock()
+			s.respond(w, r, map[string]string{"message": "Host updated", "host": host})
+		} else {
+			s.monitor.mu.Unlock()
+			http.Error(w, "Host not found", http.StatusNotFound)
+		}
 
 	case http.MethodDelete:
 		body, _ := io.ReadAll(r.Body)
@@ -430,23 +487,61 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
-	// This is just a placeholder for the /form/ prefix.
-	// In a real app we might serve more complex forms here.
-	// For now, let's just show a simple management page.
+	s.monitor.mu.RLock()
+	var hosts []*HostStatus
+	for _, h := range s.monitor.Hosts {
+		hosts = append(hosts, h)
+	}
+	s.monitor.mu.RUnlock()
+
+	sort.Slice(hosts, func(i, j int) bool {
+		return hosts[i].Host < hosts[j].Host
+	})
+
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, "<html><body><h1>Management Interface</h1>")
-	fmt.Fprintf(w, "<p>Welcome to the management interface. You are authenticated.</p>")
-	fmt.Fprintf(w, "<ul><li><a href='/'>Back to Status</a></li></ul>")
+	fmt.Fprintf(w, "<html><head><title>Management</title><style>table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:8px;}</style></head><body>")
+	fmt.Fprintf(w, "<h1>Management Interface</h1>")
+	fmt.Fprintf(w, "<p><a href='/'>Back to Status</a></p>")
+
+	fmt.Fprintf(w, "<h2>Hosts</h2>")
+	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Type</th><th>Actions</th></tr>")
+	for _, h := range hosts {
+		hType := "Dynamic"
+		if h.IsPredefined {
+			hType = "Predefined"
+		}
+		fmt.Fprintf(w, "<tr>")
+		fmt.Fprintf(w, "<td>%s</td>", h.Host)
+		fmt.Fprintf(w, "<td><input type='text' id='int-%s' value='%v' size='5'></td>", h.Host, h.Interval)
+		fmt.Fprintf(w, "<td><input type='text' id='tout-%s' value='%v' size='5'></td>", h.Host, h.Timeout)
+		fmt.Fprintf(w, "<td>%s</td>", hType)
+		fmt.Fprintf(w, "<td>")
+		fmt.Fprintf(w, "<button onclick=\"updateHost('%s')\">Update</button> ", h.Host)
+		fmt.Fprintf(w, "<button onclick=\"deleteHost('%s')\">Delete</button>", h.Host)
+		fmt.Fprintf(w, "</td>")
+		fmt.Fprintf(w, "</tr>")
+	}
+	fmt.Fprintf(w, "</table>")
 
 	fmt.Fprintf(w, "<h2>Add Host</h2>")
-	fmt.Fprintf(w, "<form action='/api/hosts' method='POST' onsubmit='return submitForm(this)'>")
+	fmt.Fprintf(w, "<form onsubmit='return addHost(this)'>")
 	fmt.Fprintf(w, "Host: <input type='text' name='host' required> ")
 	fmt.Fprintf(w, "Interval: <input type='text' name='interval' placeholder='10m'> ")
 	fmt.Fprintf(w, "Timeout: <input type='text' name='timeout' placeholder='5s'> ")
 	fmt.Fprintf(w, "<input type='submit' value='Add'>")
 	fmt.Fprintf(w, "</form>")
 
-	fmt.Fprintf(w, "<script>function submitForm(f){ var host=f.host.value; var interval=f.interval.value; var timeout=f.timeout.value; fetch('/api/hosts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host:host, interval:interval, timeout:timeout})}).then(r=>r.json()).then(d=>alert(d.message)).catch(e=>alert(e)); return false; }</script>")
+	fmt.Fprintf(w, "<h2>API Keys</h2>")
+	fmt.Fprintf(w, "<button onclick='generateKey()'>Generate New Normal Key</button>")
+	fmt.Fprintf(w, "<div id='new-key' style='margin-top:10px; font-weight:bold; color:blue;'></div>")
+
+	fmt.Fprintf(w, "<script>")
+	fmt.Fprintf(w, "function addHost(f){ fetch('/api/hosts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host:f.host.value, interval:f.interval.value, timeout:f.timeout.value})}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); return false; }")
+	fmt.Fprintf(w, "function updateHost(host){ var interval=document.getElementById('int-'+host).value; var timeout=document.getElementById('tout-'+host).value; fetch('/api/hosts', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host:host, interval:interval, timeout:timeout})}).then(r=>r.json()).then(d=>alert(d.message)).catch(e=>alert(e)); }")
+	fmt.Fprintf(w, "function deleteHost(host){ if(confirm('Delete '+host+'?')){ fetch('/api/hosts', {method:'DELETE', body:host}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); } }")
+	fmt.Fprintf(w, "function generateKey(){ fetch('/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({generate:true, type:'normal'})}).then(r=>r.json()).then(d=>{ document.getElementById('new-key').innerText = 'New Key: ' + d.key; alert('Key generated and saved to config.json'); }).catch(e=>alert(e)); }")
+	fmt.Fprintf(w, "</script>")
+
 	fmt.Fprintf(w, "</body></html>")
 }
 
@@ -516,4 +611,12 @@ func normalizeTarget(target string) string {
 		return net.JoinHostPort(host, "22")
 	}
 	return target
+}
+
+func generateRandomKey(length int) string {
+	b := make([]byte, length/2)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
