@@ -780,3 +780,5 @@ FodyWeavers.xsd
 go.work
 
 # End of https://www.toptal.com/developers/gitignore/api/go
+go-cli/ssh-alive-check
+webserver/config.json
