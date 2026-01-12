@@ -14,6 +14,12 @@ import (
 	"time"
 )
 
+const (
+	Version     = "0.1.0"
+	Author      = "Sadeq <code@sadeq.uk>"
+	Description = "A lightweight tool to check if a host is responding with an SSH banner."
+)
+
 var (
 	timeout    time.Duration
 	sshPattern = regexp.MustCompile(`^SSH-[0-9.]+-[a-zA-Z0-9 .-]+`)
@@ -25,6 +31,15 @@ func main() {
 
 	flag.IntVar(&timeoutSec, "t", 5, "Timeout in seconds")
 	flag.StringVar(&inputFile, "f", "", "Input file (default stdin)")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "SSH Alive Check %s\n", Version)
+		fmt.Fprintf(os.Stderr, "Author: %s\n", Author)
+		fmt.Fprintf(os.Stderr, "%s\n\n", Description)
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "This project is licensed under the MIT License without any liability and/or obligation.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	timeout = time.Duration(timeoutSec) * time.Second
@@ -58,7 +73,7 @@ func main() {
 		for _, token := range tokens {
 			wg.Add(1)
 			sem <- struct{}{}
-			
+
 			go func(rawTarget string) {
 				defer wg.Done()
 				defer func() { <-sem }()
@@ -128,13 +143,13 @@ func checkHost(target string) string {
 	if err != nil {
 		// If EOF happened immediately?
 		if err == io.EOF {
-			return "ACTIVE_REJECT" 
+			return "ACTIVE_REJECT"
 		}
 		return "TIMEOUT"
 	}
 
 	data := string(buf[:n])
-	
+
 	// We strictly check if the data starts with the SSH pattern provided.
 	if sshPattern.MatchString(data) {
 		return "SSH"

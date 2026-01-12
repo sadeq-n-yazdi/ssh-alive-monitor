@@ -9,11 +9,18 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	Version     = "0.1.0"
+	Author      = "Sadeq <code@sadeq.uk>"
+	Description = "A web server and API for monitoring SSH availability across multiple hosts."
 )
 
 var (
@@ -100,6 +107,15 @@ func main() {
 	mux.HandleFunc("/form/", s.auth.AuthMiddleware(s.handleForm, KeyNormal))
 
 	port := flag.String("port", cfg.Port, "Port to listen on")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "SSH Alive Monitor %s\n", Version)
+		fmt.Fprintf(os.Stderr, "Author: %s\n", Author)
+		fmt.Fprintf(os.Stderr, "%s\n\n", Description)
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "This project is licensed under the MIT License without any liability and/or obligation.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if *port != "" {

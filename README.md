@@ -1,6 +1,9 @@
-Check if HOST:PORT listening to SSH or not
+# SSH Alive Check
 
-Read list of IP addresses and try to make connection and check if it can see SSH init string in certain time or not.
+Version: 0.1.0  
+Author: Sadeq <code@sadeq.uk>
+
+A tool to check if a host is responding with an SSH banner. Includes a CLI and a Web Server for monitoring.
 
 ## Go
 ### Build
@@ -267,13 +270,13 @@ Once the initial setup is complete, subsequent pushes to the `main` branch will 
 
 ```bash
 # Check hosts from a file
-uv run ssh_alive_check.py test_hosts.txt
+cd python && uv run ssh_alive_check.py ../test_hosts.txt
 
 # Check hosts from stdin
-cat test_hosts.txt | uv run ./ssh_alive_check.py
+cat test_hosts.txt | python/ssh_alive_check.py
 
 # Set custom timeout (default 5s)
-uv run ./ssh_alive_check.py -f test_hosts.txt -t 2
+python/ssh_alive_check.py -f test_hosts.txt -t 2
 ```
 
 ### Output Format
@@ -286,3 +289,8 @@ Statuses:
 - `ACTIVE_REJECT`: Connection refused.
 - `PROTOCOL_MISMATCH`: Connected but did not send SSH version string.
 
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). 
+For more information, see the [official MIT License page](https://opensource.org/license/mit).
