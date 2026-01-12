@@ -4,6 +4,11 @@ import re
 import sys
 from typing import List, Tuple, Optional
 
+VERSION = "0.1.0"
+AUTHOR = "Sadeq <code@sadeq.uk>"
+DESCRIPTION = "A lightweight tool to check if a host is responding with an SSH banner."
+LICENSE_INFO = "This project is licensed under the MIT License without any liability and/or obligation."
+
 # Regex for matching SSH server string
 # Starts with 'SSH-', followed by protocol version, hyphen, software version.
 # Example: SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
@@ -123,16 +128,24 @@ async def process_inputs(inputs: List[str], timeout: float):
     await asyncio.gather(*tasks)
 
 def main():
-    parser = argparse.ArgumentParser(description="Check SSH availability on a list of hosts.")
+    parser = argparse.ArgumentParser(
+        description=f"{DESCRIPTION}\n\nVersion: {VERSION}\nAuthor: {AUTHOR}\n\n{LICENSE_INFO}",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument('input_file', nargs='?', type=argparse.FileType('r'), default=sys.stdin,
                         help="Input file containing list of IP addresses (one per line). Defaults to stdin.")
-    parser.add_argument('--timeout', type=float, default=5.0,
+    parser.add_argument('-f', '--file', type=argparse.FileType('r'), dest='input_file_flag',
+                        help="Input file containing list of IP addresses (alternative to positional argument).")
+    parser.add_argument('-t', '--timeout', type=float, default=5.0,
                         help="Timeout in seconds for connection and data read. Default: 5.0")
     
     args = parser.parse_args()
 
+    # Determine input source
+    input_file = args.input_file_flag if args.input_file_flag else args.input_file
+    
     # Read all lines
-    lines = args.input_file.readlines()
+    lines = input_file.readlines()
     
     try:
         asyncio.run(process_inputs(lines, args.timeout))
