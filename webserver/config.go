@@ -1,22 +1,53 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 )
 
+func getFilesHash(paths []string) (string, error) {
+	hasher := sha256.New()
+	for _, path := range paths {
+		file, err := os.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				hasher.Write([]byte("notfound"))
+				continue
+			}
+			return "", err
+		}
+		if _, err := io.Copy(hasher, file); err != nil {
+			file.Close()
+			return "", err
+		}
+		file.Close()
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+type HostConfig struct {
+	Host     string `json:"host"`
+	Interval string `json:"interval,omitempty"`
+	Timeout  string `json:"timeout,omitempty"`
+	Public   bool   `json:"public,omitempty"`
+}
+
 type Config struct {
-	Port            string   `json:"port"`
-	LogLevel        string   `json:"log_level"`
-	LogComponents   []string `json:"log_components"`
-	LogColor        bool     `json:"log_color"`
-	LogFormat       string   `json:"log_format"` // "text", "json", "color"
-	DefaultInterval string   `json:"default_interval"`
-	DefaultTimeout  string   `json:"default_timeout"`
-	MasterKeys      []string `json:"master_keys"`
-	NormalKeys      []string `json:"normal_keys"`
-	PredefinedHosts []string `json:"predefined_hosts"`
-	IPWhitelist     []string `json:"ip_whitelist"`
+	Port            string       `json:"port"`
+	LogLevel        string       `json:"log_level"`
+	LogComponents   []string     `json:"log_components"`
+	LogColor        bool         `json:"log_color"`
+	LogFormat       string       `json:"log_format"` // "text", "json", "color"
+	DefaultInterval string       `json:"default_interval"`
+	DefaultTimeout  string       `json:"default_timeout"`
+	MasterKeys      []string     `json:"master_keys"`
+	NormalKeys      []string     `json:"normal_keys"`
+	PredefinedHosts []string     `json:"predefined_hosts"`
+	Hosts           []HostConfig `json:"hosts"`
+	IPWhitelist     []string     `json:"ip_whitelist"`
 }
 
 func loadConfig(path string, config *Config) error {
@@ -57,7 +88,7 @@ func GetConfig() *Config {
 	}
 
 	loadConfig("config.json", cfg)
-	loadConfig("override.json", cfg)
+	loadConfig("config-override.json", cfg)
 
 	return cfg
 }

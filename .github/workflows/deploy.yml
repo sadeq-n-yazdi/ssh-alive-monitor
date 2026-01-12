@@ -1,0 +1,102 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  setup:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install upx
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Build and Compress
+        run: |
+          cd webserver
+          go build -ldflags="-s -w" -o ../ssh-monitor .
+          cd ..
+          upx ssh-monitor
+
+      - name: Upload Files to Temp
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "ssh-monitor,webserver/config.json.sample,webserver/ssh-monitor.service"
+          target: "/tmp/ssh-monitor-setup"
+          strip_components: 0
+
+      - name: Initial Setup on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo mkdir -p /opt/ssh-monitor
+            sudo mv /tmp/ssh-monitor-setup/ssh-monitor /opt/ssh-monitor/ssh-monitor
+            sudo chmod +x /opt/ssh-monitor/ssh-monitor
+            if [ ! -f /opt/ssh-monitor/config.json ]; then
+              sudo mv /tmp/ssh-monitor-setup/webserver/config.json.sample /opt/ssh-monitor/config.json
+            fi
+            sudo mv /tmp/ssh-monitor-setup/webserver/ssh-monitor.service /opt/ssh-monitor/ssh-monitor.service
+            sudo ln -sf /opt/ssh-monitor/ssh-monitor.service /etc/systemd/system/ssh-monitor.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable ssh-monitor
+            sudo systemctl restart ssh-monitor
+            rm -rf /tmp/ssh-monitor-setup
+
+  deploy:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install upx
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Build and Compress
+        run: |
+          cd webserver
+          go build -ldflags="-s -w" -o ../ssh-monitor .
+          cd ..
+          upx ssh-monitor
+
+      - name: Deploy to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "ssh-monitor"
+          target: "/opt/ssh-monitor.tmp"
+          strip_components: 0
+
+      - name: Restart Service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo systemctl stop ssh-monitor
+            sudo mv /opt/ssh-monitor.tmp/ssh-monitor /opt/ssh-monitor/ssh-monitor
+            sudo chmod +x /opt/ssh-monitor/ssh-monitor
+            sudo systemctl start ssh-monitor
+            rm -rf /opt/ssh-monitor.tmp

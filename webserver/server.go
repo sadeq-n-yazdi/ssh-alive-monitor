@@ -21,10 +21,11 @@ var (
 )
 
 type Server struct {
-	config  *Config
-	logger  *Logger
-	auth    *AuthManager
-	monitor *Monitor
+	config      *Config
+	logger      *Logger
+	auth        *AuthManager
+	monitor     *Monitor
+	currentHash string
 }
 
 func main() {
@@ -43,21 +44,43 @@ func main() {
 	auth := NewAuthManager(cfg)
 	monitor := NewMonitor(logger)
 
-	// Add predefined hosts
+	// Add predefined hosts from simple list
 	defaultInterval, _ := time.ParseDuration(cfg.DefaultInterval)
 	defaultTimeout, _ := time.ParseDuration(cfg.DefaultTimeout)
 	for _, h := range cfg.PredefinedHosts {
 		monitor.AddHost(normalizeTarget(h), defaultInterval, defaultTimeout, true)
 	}
 
+	// Add detailed hosts from structured list
+	for _, hc := range cfg.Hosts {
+		interval := defaultInterval
+		if hc.Interval != "" {
+			if d, err := time.ParseDuration(hc.Interval); err == nil {
+				interval = d
+			}
+		}
+		timeout := defaultTimeout
+		if hc.Timeout != "" {
+			if d, err := time.ParseDuration(hc.Timeout); err == nil {
+				timeout = d
+			}
+		}
+		monitor.AddHost(normalizeTarget(hc.Host), interval, timeout, hc.Public)
+	}
+
 	monitor.Start()
 
+	initialHash, _ := getFilesHash([]string{"config.json", "config-override.json"})
+
 	s := &Server{
-		config:  cfg,
-		logger:  logger,
-		auth:    auth,
-		monitor: monitor,
+		config:      cfg,
+		logger:      logger,
+		auth:        auth,
+		monitor:     monitor,
+		currentHash: initialHash,
 	}
+
+	go s.watchConfig()
 
 	mux := http.NewServeMux()
 
@@ -96,6 +119,101 @@ func main() {
 	}
 }
 
+func (s *Server) watchConfig() {
+	configFiles := []string{"config.json", "config-override.json"}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		newHash, err := getFilesHash(configFiles)
+		if err != nil {
+			continue
+		}
+
+		if newHash != s.currentHash {
+			s.logger.Info("requests", "Config change detected, waiting 5 seconds for stability...")
+			time.Sleep(5 * time.Second)
+
+			stableHash, err := getFilesHash(configFiles)
+			if err != nil {
+				continue
+			}
+
+			if stableHash == newHash {
+				s.logger.Info("requests", "Config stable, reloading...")
+				s.reloadConfig()
+			} else {
+				s.logger.Info("requests", "Config still changing, will check again...")
+			}
+		}
+	}
+}
+
+func (s *Server) reloadConfig() {
+	cfg := GetConfig()
+	s.applyConfig(cfg)
+
+	newHash, _ := getFilesHash([]string{"config.json", "config-override.json"})
+	s.currentHash = newHash
+}
+
+func (s *Server) applyConfig(cfg *Config) {
+	s.config = cfg
+
+	// Update Logger
+	s.logger.Level = parseLogLevel(cfg.LogLevel)
+	s.logger.UseColor = cfg.LogFormat == "color"
+	s.logger.UseJSON = cfg.LogFormat == "json"
+	s.logger.Components = make(map[string]bool)
+	for _, c := range cfg.LogComponents {
+		s.logger.Components[c] = true
+	}
+
+	// Update AuthManager
+	s.auth.mu.Lock()
+	s.auth.Keys = make(map[string]APIKey)
+	for _, k := range cfg.MasterKeys {
+		s.auth.Keys[k] = APIKey{Key: k, Type: KeyMaster, Enabled: true}
+	}
+	for _, k := range cfg.NormalKeys {
+		s.auth.Keys[k] = APIKey{Key: k, Type: KeyNormal, Enabled: true}
+	}
+	s.auth.mu.Unlock()
+
+	// Update Monitor
+	s.monitor.mu.Lock()
+	// Clear existing hosts
+	s.monitor.Hosts = make(map[string]*HostStatus)
+	s.monitor.mu.Unlock()
+
+	defaultInterval, _ := time.ParseDuration(cfg.DefaultInterval)
+	defaultTimeout, _ := time.ParseDuration(cfg.DefaultTimeout)
+
+	// Add predefined hosts
+	for _, h := range cfg.PredefinedHosts {
+		s.monitor.AddHost(normalizeTarget(h), defaultInterval, defaultTimeout, true)
+	}
+
+	// Add detailed hosts
+	for _, hc := range cfg.Hosts {
+		interval := defaultInterval
+		if hc.Interval != "" {
+			if d, err := time.ParseDuration(hc.Interval); err == nil {
+				interval = d
+			}
+		}
+		timeout := defaultTimeout
+		if hc.Timeout != "" {
+			if d, err := time.ParseDuration(hc.Timeout); err == nil {
+				timeout = d
+			}
+		}
+		s.monitor.AddHost(normalizeTarget(hc.Host), interval, timeout, hc.Public)
+	}
+
+	s.logger.Info("requests", "Configuration reloaded successfully")
+}
+
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -122,6 +240,15 @@ func (rw *responseWriter) WriteHeader(code int) {
 }
 
 // --- Handlers ---
+
+func (s *Server) saveConfig() error {
+	err := s.config.Save("config.json")
+	if err == nil {
+		newHash, _ := getFilesHash([]string{"config.json", "config-override.json"})
+		s.currentHash = newHash
+	}
+	return err
+}
 
 func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("requests", "Admin task: %s %s", r.Method, r.URL.Path)
@@ -162,7 +289,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		// Sync to config
 		s.config.MasterKeys = s.auth.GetKeysByType(KeyMaster)
 		s.config.NormalKeys = s.auth.GetKeysByType(KeyNormal)
-		s.config.Save("config.json")
+		s.saveConfig()
 
 		s.respond(w, r, map[string]string{"message": "Key added", "key": req.Key})
 
@@ -177,7 +304,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		// Sync to config
 		s.config.MasterKeys = s.auth.GetKeysByType(KeyMaster)
 		s.config.NormalKeys = s.auth.GetKeysByType(KeyNormal)
-		s.config.Save("config.json")
+		s.saveConfig()
 
 		s.respond(w, r, map[string]string{"message": "Key deleted"})
 
@@ -323,6 +450,10 @@ func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
 		_, isAuthenticated = s.auth.Authenticate(authKey)
 	}
 
+	if !isAuthenticated {
+		isAuthenticated = s.isWhitelisted(r.RemoteAddr)
+	}
+
 	query := r.URL.Query()
 	sinceStr := query.Get("since")
 	limitStr := query.Get("limit")
@@ -336,7 +467,7 @@ func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
 	if !isAuthenticated {
 		filteredHosts = make(map[string]bool)
 		for _, h := range s.monitor.Hosts {
-			if h.IsPredefined {
+			if h.Public {
 				filteredHosts[h.Host] = true
 			}
 		}
@@ -442,7 +573,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.monitor.mu.RLock()
 	var hosts []*HostStatus
 	for _, h := range s.monitor.Hosts {
-		if isAuthenticated || h.IsPredefined {
+		if isAuthenticated || h.Public {
 			hosts = append(hosts, h)
 		}
 	}
@@ -452,7 +583,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	for i := len(s.monitor.History) - 1; i >= 0; i-- {
 		res := s.monitor.History[i]
 		if _, ok := results[res.Host]; !ok {
-			if h, ok2 := s.monitor.Hosts[res.Host]; ok2 && (isAuthenticated || h.IsPredefined) {
+			if h, ok2 := s.monitor.Hosts[res.Host]; ok2 && (isAuthenticated || h.Public) {
 				results[res.Host] = res
 			}
 		}
@@ -470,7 +601,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if isAuthenticated {
 		fmt.Fprintf(w, "<p>Authenticated access. <a href='/form/'>Manage Hosts/Keys</a></p>")
 	} else {
-		fmt.Fprintf(w, "<p>Public access (showing predefined hosts only). <a href='/form/'>Login</a></p>")
+		fmt.Fprintf(w, "<p>Public access (showing public hosts only). <a href='/form/'>Login</a></p>")
 	}
 	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Last Run</th><th>Status</th></tr>")
 	for _, h := range hosts {
@@ -506,9 +637,9 @@ func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<h2>Hosts</h2>")
 	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Type</th><th>Actions</th></tr>")
 	for _, h := range hosts {
-		hType := "Dynamic"
-		if h.IsPredefined {
-			hType = "Predefined"
+		hType := "Private"
+		if h.Public {
+			hType = "Public"
 		}
 		fmt.Fprintf(w, "<tr>")
 		fmt.Fprintf(w, "<td>%s</td>", h.Host)
@@ -551,10 +682,8 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, data interface{
 	format := r.URL.Query().Get("format")
 
 	// If it's a simple map[string]string (like a message response),
-	// default to JSON if we're not sure, especially for API calls
-	isAPICall := strings.HasPrefix(r.URL.Path, "/api/")
-
-	if format == "json" || strings.Contains(accept, "application/json") || (isAPICall && format == "" && !strings.Contains(accept, "yaml")) {
+	// default to plain text unless explicitly requested otherwise.
+	if format == "json" || strings.Contains(accept, "application/json") {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(data)
 		return

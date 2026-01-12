@@ -87,8 +87,33 @@ The server reads configuration from `config.json` and `override.json`.
 | `default_interval` | Interval between checks (e.g., `10m`, `1h`) | `10m` |
 | `default_timeout` | Timeout for each SSH check (e.g., `5s`) | `5s` |
 | `master_keys` | List of initial master API keys | `["master-key-123"]` |
-| `predefined_hosts`| Hosts visible without an API key | `[]` |
+| `predefined_hosts`| Simple list of hosts visible without an API key | `[]` |
+| `hosts` | Detailed list of hosts with custom settings | `[]` |
 | `ip_whitelist` | IP ranges allowed to see index page without key | `[]` |
+
+#### Detailed Host Configuration
+
+The `hosts` field allows defining hosts with specific check parameters and visibility:
+
+```json
+"hosts": [
+    {
+        "host": "private-server.com:22",
+        "interval": "1m",
+        "timeout": "2s",
+        "public": false
+    },
+    {
+        "host": "public-server.com",
+        "public": true
+    }
+]
+```
+
+- `host`: The address to check (required).
+- `interval`: Override `default_interval` (optional).
+- `timeout`: Override `default_timeout` (optional).
+- `public`: If `true`, visible on the public status page (optional, default `false`).
 
 ### Web Interface
 
@@ -169,6 +194,72 @@ The server provides a simple web interface for monitoring and management:
   ```bash
   curl -X DELETE -H "X-API-Key: MASTER_KEY" "http://localhost:8080/api/keys?key=some-key"
   ```
+
+## Deployment
+
+### Makefile
+
+A `Makefile` is provided for local builds and manual deployment:
+
+```bash
+# Build the web server
+make build
+
+# Build and compress with upx
+make compress
+
+# Deploy to VPS (requires vps03 to be defined in ~/.ssh/config or environment)
+make deploy
+```
+
+### Docker
+
+You can run the web server using Docker:
+
+```bash
+# Build image
+docker build -t ssh-monitor .
+
+# Run container
+docker run -d -p 8080:8080 -v $(pwd)/config.json:/app/config.json ssh-monitor
+```
+
+### GitHub Actions
+
+The repository includes a GitHub Action for automated deployment to your VPS on every push to the `main` branch.
+
+#### Setting up GitHub Secrets
+
+To use the deployment workflow, you must add the following secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
+
+1.  `VPS_HOST`: The IP address or hostname of your VPS (e.g., `vps03.example.com`).
+2.  `VPS_USERNAME`: The SSH username used to log in (e.g., `root`).
+3.  `SSH_PRIVATE_KEY`: Your SSH private key. 
+    *   Generate a new key pair on your local machine if you don't have one: `ssh-keygen -t ed25519 -C "github-actions"`
+    *   Add the **public key** (`id_ed25519.pub`) to `~/.ssh/authorized_keys` on your VPS.
+    *   Paste the **private key** (`id_ed25519`) content into this GitHub secret.
+
+### Initial VPS Setup via GitHub Actions
+
+If you are deploying to a fresh VPS, you can use the manual "setup" workflow to prepare the environment:
+
+1. Go to the **Actions** tab in your GitHub repository.
+2. Select the **Deploy to VPS** workflow on the left.
+3. Click the **Run workflow** dropdown and select the branch (usually `main`).
+4. Click **Run workflow**.
+
+This manual action will:
+- Create `/opt/ssh-monitor` on your VPS.
+- Build and upload the `ssh-monitor` binary.
+- Initialize `config.json` (from sample) if it doesn't already exist.
+- Install and link the `ssh-monitor.service`.
+- Reload systemd and start the service.
+
+Once the initial setup is complete, subsequent pushes to the `main` branch will automatically update the binary and restart the service.
+
+#### Notes on SSH Setup
+- Ensure the user specified in `VPS_USERNAME` has `sudo` privileges without a password for `systemctl` commands if you want the service restart to work automatically.
+- Alternatively, you can adjust the `.github/workflows/deploy.yml` to match your specific server permissions.
 
 ## Python
 

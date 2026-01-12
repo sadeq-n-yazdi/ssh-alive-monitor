@@ -9,12 +9,12 @@ import (
 )
 
 type HostStatus struct {
-	Host         string        `json:"host"`
-	Interval     time.Duration `json:"interval"`
-	Timeout      time.Duration `json:"timeout"`
-	LastRun      time.Time     `json:"last_run"`
-	NextRun      time.Time     `json:"next_run"`
-	IsPredefined bool          `json:"is_predefined"`
+	Host     string        `json:"host"`
+	Interval time.Duration `json:"interval"`
+	Timeout  time.Duration `json:"timeout"`
+	LastRun  time.Time     `json:"last_run"`
+	NextRun  time.Time     `json:"next_run"`
+	Public   bool          `json:"public"`
 }
 
 type CheckResult struct {
@@ -40,17 +40,17 @@ func NewMonitor(logger *Logger) *Monitor {
 	}
 }
 
-func (m *Monitor) AddHost(host string, interval, timeout time.Duration, isPredefined bool) {
+func (m *Monitor) AddHost(host string, interval, timeout time.Duration, isPublic bool) {
 	m.mu.Lock()
 	m.Hosts[host] = &HostStatus{
-		Host:         host,
-		Interval:     interval,
-		Timeout:      timeout,
-		NextRun:      time.Now(), // Run immediately
-		IsPredefined: isPredefined,
+		Host:     host,
+		Interval: interval,
+		Timeout:  timeout,
+		NextRun:  time.Now(), // Run immediately
+		Public:   isPublic,
 	}
 	m.mu.Unlock()
-	m.logger.Info("checks", "Added host: %s (interval: %v, timeout: %v, predefined: %v)", host, interval, timeout, isPredefined)
+	m.logger.Info("checks", "Added host: %s (interval: %v, timeout: %v, public: %v)", host, interval, timeout, isPublic)
 }
 
 func (m *Monitor) RemoveHost(host string) {
