@@ -1,9 +1,11 @@
 # SSH Alive Check
 
 Version: 0.1.0  
-Author: Sadeq <code@sadeq.uk>
+Author: Sadeq N. Yazd
 
 A tool to check if a host is responding with an SSH banner. Includes a CLI and a Web Server for monitoring.
+
+It was created as a hobby and for personal use during the Iran Internet Blackout in January 2024.
 
 ## Go
 ### Build
