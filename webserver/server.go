@@ -536,10 +536,11 @@ func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<div id='new-key' style='margin-top:10px; font-weight:bold; color:blue;'></div>")
 
 	fmt.Fprintf(w, "<script>")
-	fmt.Fprintf(w, "function addHost(f){ fetch('/api/hosts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host:f.host.value, interval:f.interval.value, timeout:f.timeout.value})}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); return false; }")
-	fmt.Fprintf(w, "function updateHost(host){ var interval=document.getElementById('int-'+host).value; var timeout=document.getElementById('tout-'+host).value; fetch('/api/hosts', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host:host, interval:interval, timeout:timeout})}).then(r=>r.json()).then(d=>alert(d.message)).catch(e=>alert(e)); }")
-	fmt.Fprintf(w, "function deleteHost(host){ if(confirm('Delete '+host+'?')){ fetch('/api/hosts', {method:'DELETE', body:host}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); } }")
-	fmt.Fprintf(w, "function generateKey(){ fetch('/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({generate:true, type:'normal'})}).then(r=>r.json()).then(d=>{ document.getElementById('new-key').innerText = 'New Key: ' + d.key; alert('Key generated and saved to config.json'); }).catch(e=>alert(e)); }")
+	fmt.Fprintf(w, "function copyToClipboard(text) { navigator.clipboard.writeText(text).then(() => { alert('Key copied to clipboard'); }).catch(err => { console.error('Failed to copy: ', err); }); }")
+	fmt.Fprintf(w, "function addHost(f){ fetch('/api/hosts', {method:'POST', headers:{'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify({host:f.host.value, interval:f.interval.value, timeout:f.timeout.value})}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); return false; }")
+	fmt.Fprintf(w, "function updateHost(host){ var interval=document.getElementById('int-'+host).value; var timeout=document.getElementById('tout-'+host).value; fetch('/api/hosts', {method:'PUT', headers:{'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify({host:host, interval:interval, timeout:timeout})}).then(r=>r.json()).then(d=>alert(d.message)).catch(e=>alert(e)); }")
+	fmt.Fprintf(w, "function deleteHost(host){ if(confirm('Delete '+host+'?')){ fetch('/api/hosts', {method:'DELETE', headers:{'Accept':'application/json'}, body:host}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); } }")
+	fmt.Fprintf(w, "function generateKey(){ fetch('/api/keys', {method:'POST', headers:{'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify({generate:true, type:'normal'})}).then(r=>r.json()).then(d=>{ document.getElementById('new-key').innerHTML = 'New Key: <code id=\"key-val\">' + d.key + '</code> <button onclick=\"copyToClipboard(\\''+d.key+'\\')\">Copy</button>'; alert('Key generated and saved to config.json'); }).catch(e=>alert(e)); }")
 	fmt.Fprintf(w, "</script>")
 
 	fmt.Fprintf(w, "</body></html>")
@@ -547,10 +548,13 @@ func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) respond(w http.ResponseWriter, r *http.Request, data interface{}) {
 	accept := r.Header.Get("Accept")
-
-	// Support ?format= query param for convenience too
 	format := r.URL.Query().Get("format")
-	if format == "json" || strings.Contains(accept, "application/json") {
+
+	// If it's a simple map[string]string (like a message response),
+	// default to JSON if we're not sure, especially for API calls
+	isAPICall := strings.HasPrefix(r.URL.Path, "/api/")
+
+	if format == "json" || strings.Contains(accept, "application/json") || (isAPICall && format == "" && !strings.Contains(accept, "yaml")) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(data)
 		return
