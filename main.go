@@ -15,11 +15,8 @@ import (
 )
 
 var (
-	timeout     time.Duration
-	sshPattern  = regexp.MustCompile(`^SSH-[0-9.]+-[a-zA-Z0-9 .-]+`)
-	// Regex to loosely identify things that look like hosts/IPs with optional ports
-	// This captures IPv4, IPv6 (brackets), and hostnames, with optional :port
-	hostPattern = regexp.MustCompile(`(?:[a-fA-F0-9:]+|[a-fA-F0-9:]+\]|[a-zA-Z0-9._-]+)(?::[0-9]+)?`)
+	timeout    time.Duration
+	sshPattern = regexp.MustCompile(`^SSH-[0-9.]+-[a-zA-Z0-9 .-]+`)
 )
 
 func main() {
@@ -47,30 +44,34 @@ func main() {
 
 	var foundSSH atomic.Bool
 	var wg sync.WaitGroup
-
-	// Use a channel to limit concurrency slightly if needed, but for this simple app, 
-	// unbounded (limited by system resources) is usually fine for reasonable inputs.
-	// For robustness, let's use a semaphore-like channel to limit to e.g., 100 concurrent checks.
+	// Limit concurrency to avoid file descriptor exhaustion on large lists
 	sem := make(chan struct{}, 100)
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Find all matches in the line
-		matches := hostPattern.FindAllString(line, -1)
-		for _, target := range matches {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// Split line by whitespace to handle multiple hosts per line or simple lists
+		tokens := strings.Fields(line)
+		for _, token := range tokens {
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(t string) {
+			
+			go func(rawTarget string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				
-				result := checkHost(t)
-				fmt.Printf("%s %s\n", t, result)
-				
-				if result == "SSH" {
+
+				target := normalizeTarget(rawTarget)
+				status := checkHost(target)
+
+				fmt.Printf("%s %s\n", target, status)
+
+				if status == "SSH" {
 					foundSSH.Store(true)
 				}
-			}(target)
+			}(token)
 		}
 	}
 
@@ -83,82 +84,68 @@ func main() {
 	}
 }
 
-func checkHost(target string) string {
-	// If no port specified, default to 22
-	if !strings.Contains(target, ":") {
-		target = net.JoinHostPort(target, "22")
-	} else {
-		// Handle IPv6 literal with port case e.g. [::1]:22 vs [::1]
-		// net.SplitHostPort helps parse, but if we already have it from regex...
-		// Our regex `(?:[a-fA-F0-9:]+|\[[a-fA-F0-9:]+\]|[a-zA-Z0-9.-]+)(?::[0-9]+)?` might capture "google.com" without port.
-		// If it has a colon but not inside brackets?
-		// Simplest check: does it end with `:[0-9]+`?
-		// Or try SplitHostPort. If it fails, add :22.
-		_, _, err := net.SplitHostPort(target)
-		if err != nil {
-			// Likely missing port, or invalid format. 
-			// If it's an IPv6 literal without brackets, SplitHostPort might fail or return too many colons.
-			// Given the regex, it's safer to attempt to Add :22 if SplitHostPort fails assuming it's just a host.
-			// But careful with raw IPv6.
-			// Let's assume if the last colon is followed by digits, it's a port.
-			if !strings.Contains(target, "]:") && strings.Count(target, ":") > 1 && !strings.HasPrefix(target, "[") {
-				// Raw IPv6?
-				target = net.JoinHostPort(target, "22")
-			} else if !strings.Contains(target, ":") {
-				target = net.JoinHostPort(target, "22")
-			}
-		}
+func normalizeTarget(target string) string {
+	// Attempt to split host and port
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		// If error contains "missing port" or "too many colons" (raw IPv6),
+		// assume the whole string is the host and default to port 22.
+		// Note: net.SplitHostPort("::1") returns "too many colons in address".
+		// net.SplitHostPort("127.0.0.1") returns "missing port in address".
+		return net.JoinHostPort(target, "22")
 	}
+	if port == "" {
+		return net.JoinHostPort(host, "22")
+	}
+	return target
+}
 
+func checkHost(target string) string {
 	conn, err := net.DialTimeout("tcp", target, timeout)
 	if err != nil {
 		if opErr, ok := err.(*net.OpError); ok {
 			if opErr.Timeout() {
 				return "TIMEOUT"
 			}
-			// check for connection refused
-			// The error message for refused usually contains "connection refused"
-			if strings.Contains(err.Error(), "refused") {
+			// systematic way to check for connection refused
+			if isConnectionRefused(err) {
 				return "ACTIVE_REJECT"
 			}
-			// Network unreachable, etc.
-			// Treat as generic failure or timeout?
-			// User asked for TIMEOUT / ACTIVEREJEVT / SSH.
-			// If host is down, it's usually timeout.
 		}
-		// Fallback for other errors (lookup failure etc)
-		return "TIMEOUT" // effectively unreachable
+		// Fallback for other errors (e.g. no route to host), treat as TIMEOUT or specific error
+		// For the purpose of this tool, if we can't reach it, it's effectively a timeout/unreachable.
+		return "TIMEOUT"
 	}
 	defer conn.Close()
 
+	// Set a deadline for reading the banner
 	conn.SetReadDeadline(time.Now().Add(timeout))
 
-	// Buffer for the server version string
-	// SSH version string is usually short, e.g., "SSH-2.0-OpenSSH_8.2p1..."
-	// RFC 4253: server sends identification string.
-	// Max length 255 bytes including CR LF.
+	// SSH identification string must be the first line(s).
+	// We will read a chunk and check the prefix.
 	buf := make([]byte, 255)
 	n, err := conn.Read(buf)
 	if err != nil {
+		// If EOF happened immediately?
 		if err == io.EOF {
-			return "CLOSED"
+			return "ACTIVE_REJECT" 
 		}
-		// Read timeout
 		return "TIMEOUT"
 	}
 
 	data := string(buf[:n])
-	// The RFC says the server may send other lines before the version string, 
-	// but usually it's the first thing or very early.
-	// We'll check if the *response* (first read) *starts* with the pattern, 
-	// or contains it if we want to be lenient. 
-	// Prompt says: "if it starts with 'SSH-[0-9.]+-[a-zA-Z0-9 .-]+'".
-	// Note: The server string might have trailing \r\n. Regex handles start.
 	
-	// We need to match the specific regex provided.
+	// We strictly check if the data starts with the SSH pattern provided.
 	if sshPattern.MatchString(data) {
 		return "SSH"
 	}
 
-	return "PROTOCOL_MISMATCH"
+	// If we connected but didn't get SSH banner
+	return "ACTIVE_REJECT" // Or "PROTOCOL_MISMATCH" but prompt asks for (TIMOUT/ACTIVEREJEVT/SSH)
+}
+
+func isConnectionRefused(err error) bool {
+	// Go's net package doesn't expose a direct "ConnectionRefused" error type across all platforms consistently
+	// without inspecting the syscall error, but checking the string is a common pragmatic fallback.
+	return strings.Contains(err.Error(), "refused")
 }
