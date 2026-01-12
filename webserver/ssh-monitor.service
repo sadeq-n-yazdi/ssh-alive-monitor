@@ -1,0 +1,13 @@
+[Unit]
+Description=SSH Alive Monitor Web Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ssh-monitor
+ExecStart=/opt/ssh-monitor/ssh-monitor
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
