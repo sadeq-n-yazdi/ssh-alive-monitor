@@ -1,0 +1,11 @@
+{
+  "port": "8080",
+  "log_level": "info",
+  "log_components": ["requests", "response", "checks"],
+  "log_format": "color",
+  "default_interval": "10m",
+  "default_timeout": "5s",
+  "master_keys": ["YOUR_MASTER_KEY_HERE"],
+  "predefined_hosts": ["127.0.0.1:22"],
+  "ip_whitelist": ["127.0.0.1/32", "81.106.0.0/15"]
+}

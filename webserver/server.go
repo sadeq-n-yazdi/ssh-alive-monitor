@@ -5,12 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -18,146 +18,493 @@ var (
 	sshPattern = regexp.MustCompile(`^SSH-[0-9.]+-[a-zA-Z0-9 .-]+`)
 )
 
-// Configuration
-const (
-	DefaultInterval = 10 * time.Minute
-	HistoryCapacity = 50 // Enough for > 6 hours at 10m interval
-	WorkerConcurrency = 100
-)
-
-// Data Models
-type CheckResult struct {
-	Host   string `json:"host" yaml:"host"`
-	Status string `json:"status" yaml:"status"`
-}
-
-type RunResult struct {
-	Time    time.Time     `json:"time" yaml:"time"`
-	Results []CheckResult `json:"results" yaml:"results"`
-}
-
-type AppState struct {
-	Hosts   []string
-	History []RunResult
-	mu      sync.RWMutex
-}
-
-var state = AppState{
-	Hosts:   []string{},
-	History: make([]RunResult, 0, HistoryCapacity),
+type Server struct {
+	config  *Config
+	logger  *Logger
+	auth    *AuthManager
+	monitor *Monitor
 }
 
 func main() {
-	port := flag.String("port", "8080", "Port to listen on")
+	cfg := GetConfig()
+
+	logger := &Logger{
+		Level:      parseLogLevel(cfg.LogLevel),
+		Components: make(map[string]bool),
+		UseColor:   cfg.LogFormat == "color",
+		UseJSON:    cfg.LogFormat == "json",
+	}
+	for _, c := range cfg.LogComponents {
+		logger.Components[c] = true
+	}
+
+	auth := NewAuthManager(cfg.MasterKeys)
+	monitor := NewMonitor(logger)
+
+	// Add predefined hosts
+	defaultInterval, _ := time.ParseDuration(cfg.DefaultInterval)
+	defaultTimeout, _ := time.ParseDuration(cfg.DefaultTimeout)
+	for _, h := range cfg.PredefinedHosts {
+		monitor.AddHost(normalizeTarget(h), defaultInterval, defaultTimeout, true)
+	}
+
+	monitor.Start()
+
+	s := &Server{
+		config:  cfg,
+		logger:  logger,
+		auth:    auth,
+		monitor: monitor,
+	}
+
+	mux := http.NewServeMux()
+
+	// API Keys Management (Master only)
+	mux.HandleFunc("/api/keys", s.auth.AuthMiddleware(s.handleKeys, KeyMaster))
+
+	// Hosts Management (Master can do everything, Normal can add/remove/change)
+	mux.HandleFunc("/api/hosts", s.auth.AuthMiddleware(s.handleHosts, KeyNormal))
+
+	// Results (Normal and Master)
+	mux.HandleFunc("/api/results", s.handleResults)
+
+	// Index page
+	mux.HandleFunc("/", s.handleIndex)
+
+	// Form interface
+	mux.HandleFunc("/form/", s.auth.AuthMiddleware(s.handleForm, KeyNormal))
+
+	port := flag.String("port", cfg.Port, "Port to listen on")
 	flag.Parse()
 
-	// Start the background monitor
-	go monitorLoop()
+	if *port != "" {
+		cfg.Port = *port
+	}
 
-	// API Handlers
-	http.HandleFunc("/api/hosts", handleHosts)
-	http.HandleFunc("/api/results", handleResults)
+	serverAddr := ":" + *port
+	logger.Info("requests", "Server starting on %s", serverAddr)
 
-	fmt.Printf("Server starting on port %s...\n", *port)
-	log.Fatal(http.ListenAndServe(":"+*port, nil))
-}
+	srv := &http.Server{
+		Addr:    serverAddr,
+		Handler: s.loggingMiddleware(mux),
+	}
 
-// --- Monitor Logic ---
-
-func monitorLoop() {
-	ticker := time.NewTicker(DefaultInterval)
-	defer ticker.Stop()
-
-	// Run immediately on start
-	runChecks()
-
-	for range ticker.C {
-		runChecks()
+	if err := srv.ListenAndServe(); err != nil {
+		logger.Error("requests", "Server failed: %v", err)
 	}
 }
 
-func runChecks() {
-	state.mu.RLock()
-	hosts := make([]string, len(state.Hosts))
-	copy(hosts, state.Hosts)
-	state.mu.RUnlock()
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 
-	if len(hosts) == 0 {
+		// Capture response status code
+		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+
+		next.ServeHTTP(rw, r)
+
+		duration := time.Since(start)
+		s.logger.Info("requests", "%s %s %s %d %v", r.RemoteAddr, r.Method, r.URL.Path, rw.status, duration)
+		s.logger.Debug("response", "Response sent: %d", rw.status)
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// --- Handlers ---
+
+func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("requests", "Admin task: %s %s", r.Method, r.URL.Path)
+	switch r.Method {
+	case http.MethodGet:
+		s.auth.mu.RLock()
+		keys := make([]APIKey, 0, len(s.auth.Keys))
+		for _, k := range s.auth.Keys {
+			keys = append(keys, k)
+		}
+		s.auth.mu.RUnlock()
+		s.respond(w, r, keys)
+
+	case http.MethodPost:
+		var req struct {
+			Key  string     `json:"key"`
+			Type APIKeyType `json:"type"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Key == "" {
+			http.Error(w, "Key is required", http.StatusBadRequest)
+			return
+		}
+		if req.Type == "" {
+			req.Type = KeyNormal
+		}
+		s.auth.AddKey(req.Key, req.Type)
+		s.respond(w, r, map[string]string{"message": "Key added"})
+
+	case http.MethodDelete:
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "Key is required", http.StatusBadRequest)
+			return
+		}
+		s.auth.DeleteKey(key)
+		s.respond(w, r, map[string]string{"message": "Key deleted"})
+
+	case http.MethodPatch:
+		var req struct {
+			Key     string `json:"key"`
+			Enabled bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.auth.SetEnabled(req.Key, req.Enabled)
+		s.respond(w, r, map[string]string{"message": "Key status updated"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
+	// For GET /api/hosts, we only show all hosts if authenticated.
+	// However, AuthMiddleware is already applied to /api/hosts for KeyNormal.
+	// So we don't need extra check here unless we want it to be public too.
+	// The requirement says: "these host heck status should be visible without need a key"
+	// "make sure the index page shows the status of all monitorin hosts based on user access (with API Key, show all of them, without API key, show only predefined ones)"
+	// This implies /api/results and / are what need conditional visibility.
+
+	switch r.Method {
+	case http.MethodGet:
+		s.monitor.mu.RLock()
+		hosts := make([]*HostStatus, 0, len(s.monitor.Hosts))
+		for _, h := range s.monitor.Hosts {
+			hosts = append(hosts, h)
+		}
+		s.monitor.mu.RUnlock()
+		s.respond(w, r, hosts)
+
+	case http.MethodPost:
+		var req struct {
+			Host     string `json:"host"`
+			Interval string `json:"interval"`
+			Timeout  string `json:"timeout"`
+		}
+
+		// Handle both JSON and plain text body for backward compatibility or simple adds
+		contentType := r.Header.Get("Content-Type")
+		if strings.Contains(contentType, "application/json") {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		} else {
+			body, _ := io.ReadAll(r.Body)
+			req.Host = strings.TrimSpace(string(body))
+		}
+
+		if req.Host == "" {
+			http.Error(w, "Host is required", http.StatusBadRequest)
+			return
+		}
+
+		interval, _ := time.ParseDuration(req.Interval)
+		if interval == 0 {
+			interval, _ = time.ParseDuration(s.config.DefaultInterval)
+		}
+		timeout, _ := time.ParseDuration(req.Timeout)
+		if timeout == 0 {
+			timeout, _ = time.ParseDuration(s.config.DefaultTimeout)
+		}
+
+		host := normalizeTarget(req.Host)
+		s.monitor.AddHost(host, interval, timeout, false)
+		s.respond(w, r, map[string]string{"message": "Host added", "host": host})
+
+	case http.MethodDelete:
+		body, _ := io.ReadAll(r.Body)
+		host := strings.TrimSpace(string(body))
+		if host == "" {
+			host = r.URL.Query().Get("host")
+		}
+		if host == "" {
+			http.Error(w, "Host is required", http.StatusBadRequest)
+			return
+		}
+		host = normalizeTarget(host)
+		s.monitor.RemoveHost(host)
+		s.respond(w, r, map[string]string{"message": "Host removed", "host": host})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
+	authKey := r.Header.Get("X-API-Key")
+	if authKey == "" {
+		_, password, ok := r.BasicAuth()
+		if ok {
+			authKey = password
+		}
+	}
+
+	isAuthenticated := false
+	if authKey != "" {
+		_, isAuthenticated = s.auth.Authenticate(authKey)
+	}
+
+	query := r.URL.Query()
+	sinceStr := query.Get("since")
+	limitStr := query.Get("limit")
+	hostFilter := query.Get("host")
+
+	s.monitor.mu.RLock()
+	results := make([]CheckResult, len(s.monitor.History))
+	copy(results, s.monitor.History)
+
+	var filteredHosts map[string]bool
+	if !isAuthenticated {
+		filteredHosts = make(map[string]bool)
+		for _, h := range s.monitor.Hosts {
+			if h.IsPredefined {
+				filteredHosts[h.Host] = true
+			}
+		}
+	}
+	s.monitor.mu.RUnlock()
+
+	// Filter
+	filtered := make([]CheckResult, 0)
+	cutoff := time.Time{}
+	if sinceStr != "" {
+		dur, err := time.ParseDuration(sinceStr)
+		if err == nil {
+			cutoff = time.Now().Add(-dur)
+		}
+	}
+
+	for _, res := range results {
+		if !isAuthenticated {
+			if filteredHosts == nil || !filteredHosts[res.Host] {
+				continue
+			}
+		}
+		if !cutoff.IsZero() && res.Time.Before(cutoff) {
+			continue
+		}
+		if hostFilter != "" && !strings.Contains(res.Host, hostFilter) {
+			continue
+		}
+		filtered = append(filtered, res)
+	}
+
+	// Limit
+	if limitStr != "" {
+		limit, _ := strconv.Atoi(limitStr)
+		if limit > 0 && limit < len(filtered) {
+			filtered = filtered[len(filtered)-limit:]
+		}
+	}
+
+	// Sort by time descending (latest first)
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Time.After(filtered[j].Time)
+	})
+
+	s.respond(w, r, filtered)
+}
+
+func (s *Server) isWhitelisted(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	for _, cidr := range s.config.IPWhitelist {
+		// IPv6 loopback matching
+		if (cidr == "::1" || cidr == "::1/128") && (host == "::1" || host == "0:0:0:0:0:0:0:1") {
+			return true
+		}
+		if !strings.Contains(cidr, "/") {
+			// Try as plain IP
+			if cidr == host {
+				return true
+			}
+			// Also check if it's a valid IP and compare
+			if net.ParseIP(cidr).Equal(ip) {
+				return true
+			}
+			continue
+		}
+
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			if ipNet.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	authKey := r.Header.Get("X-API-Key")
+	if authKey == "" {
+		_, password, ok := r.BasicAuth()
+		if ok {
+			authKey = password
+		}
+	}
+
+	isAuthenticated := false
+	if authKey != "" {
+		_, isAuthenticated = s.auth.Authenticate(authKey)
+	}
+
+	if !isAuthenticated {
+		isAuthenticated = s.isWhitelisted(r.RemoteAddr)
+	}
+
+	s.monitor.mu.RLock()
+	var hosts []*HostStatus
+	for _, h := range s.monitor.Hosts {
+		if isAuthenticated || h.IsPredefined {
+			hosts = append(hosts, h)
+		}
+	}
+
+	// Also get latest results for these hosts
+	results := make(map[string]CheckResult)
+	for i := len(s.monitor.History) - 1; i >= 0; i-- {
+		res := s.monitor.History[i]
+		if _, ok := results[res.Host]; !ok {
+			if h, ok2 := s.monitor.Hosts[res.Host]; ok2 && (isAuthenticated || h.IsPredefined) {
+				results[res.Host] = res
+			}
+		}
+	}
+	s.monitor.mu.RUnlock()
+
+	sort.Slice(hosts, func(i, j int) bool {
+		return hosts[i].Host < hosts[j].Host
+	})
+
+	// Simple HTML response
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, "<html><head><title>SSH Monitor</title><style>table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:8px;} .SSH{color:green;} .TIMEOUT{color:red;} .ACTIVE_REJECT{color:orange;} .PROTOCOL_MISMATCH{color:purple;}</style></head><body>")
+	fmt.Fprintf(w, "<h1>SSH Monitor Status</h1>")
+	if isAuthenticated {
+		fmt.Fprintf(w, "<p>Authenticated access. <a href='/form/'>Manage Hosts/Keys</a></p>")
+	} else {
+		fmt.Fprintf(w, "<p>Public access (showing predefined hosts only). <a href='/form/'>Login</a></p>")
+	}
+	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Last Run</th><th>Status</th></tr>")
+	for _, h := range hosts {
+		status := "N/A"
+		class := ""
+		if res, ok := results[h.Host]; ok {
+			status = res.Status
+			class = res.Status
+		}
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%v</td><td>%v</td><td>%s</td><td class='%s'>%s</td></tr>",
+			h.Host, h.Interval, h.Timeout, h.LastRun.Format("15:04:05"), class, status)
+	}
+	fmt.Fprintf(w, "</table></body></html>")
+}
+
+func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
+	// This is just a placeholder for the /form/ prefix.
+	// In a real app we might serve more complex forms here.
+	// For now, let's just show a simple management page.
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, "<html><body><h1>Management Interface</h1>")
+	fmt.Fprintf(w, "<p>Welcome to the management interface. You are authenticated.</p>")
+	fmt.Fprintf(w, "<ul><li><a href='/'>Back to Status</a></li></ul>")
+
+	fmt.Fprintf(w, "<h2>Add Host</h2>")
+	fmt.Fprintf(w, "<form action='/api/hosts' method='POST' onsubmit='return submitForm(this)'>")
+	fmt.Fprintf(w, "Host: <input type='text' name='host' required> ")
+	fmt.Fprintf(w, "Interval: <input type='text' name='interval' placeholder='10m'> ")
+	fmt.Fprintf(w, "Timeout: <input type='text' name='timeout' placeholder='5s'> ")
+	fmt.Fprintf(w, "<input type='submit' value='Add'>")
+	fmt.Fprintf(w, "</form>")
+
+	fmt.Fprintf(w, "<script>function submitForm(f){ var host=f.host.value; var interval=f.interval.value; var timeout=f.timeout.value; fetch('/api/hosts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host:host, interval:interval, timeout:timeout})}).then(r=>r.json()).then(d=>alert(d.message)).catch(e=>alert(e)); return false; }</script>")
+	fmt.Fprintf(w, "</body></html>")
+}
+
+func (s *Server) respond(w http.ResponseWriter, r *http.Request, data interface{}) {
+	accept := r.Header.Get("Accept")
+
+	// Support ?format= query param for convenience too
+	format := r.URL.Query().Get("format")
+	if format == "json" || strings.Contains(accept, "application/json") {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(data)
 		return
 	}
 
-	var wg sync.WaitGroup
-	results := make([]CheckResult, len(hosts))
-	sem := make(chan struct{}, WorkerConcurrency)
-
-	for i, host := range hosts {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(index int, target string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			
-			// Normalize happens on add, but good to be safe
-			normTarget := normalizeTarget(target) 
-			status := checkHost(normTarget)
-			results[index] = CheckResult{Host: normTarget, Status: status}
-		}(i, host)
-	}
-	wg.Wait()
-
-	runResult := RunResult{
-		Time:    time.Now(),
-		Results: results,
+	if format == "yaml" || strings.Contains(accept, "application/yaml") || strings.Contains(accept, "text/yaml") {
+		w.Header().Set("Content-Type", "text/yaml")
+		s.writeYAML(w, data)
+		return
 	}
 
-	state.mu.Lock()
-	// Append to history
-	state.History = append(state.History, runResult)
-	// Trim history if it exceeds capacity (keep last N)
-	if len(state.History) > HistoryCapacity {
-		state.History = state.History[len(state.History)-HistoryCapacity:]
-	}
-	state.mu.Unlock()
+	// Default: Plain text
+	w.Header().Set("Content-Type", "text/plain")
+	s.writePlainText(w, data)
 }
 
-// Reuse logic from main.go
-func checkHost(target string) string {
-	timeout := 5 * time.Second
-	conn, err := net.DialTimeout("tcp", target, timeout)
-	if err != nil {
-		if opErr, ok := err.(*net.OpError); ok {
-			if opErr.Timeout() {
-				return "TIMEOUT"
-			}
-			if isConnectionRefused(err) {
-				return "ACTIVE_REJECT"
-			}
+func (s *Server) writeYAML(w io.Writer, data interface{}) {
+	switch v := data.(type) {
+	case []CheckResult:
+		for _, res := range v {
+			fmt.Fprintf(w, "- host: %s\n", res.Host)
+			fmt.Fprintf(w, "  status: %s\n", res.Status)
+			fmt.Fprintf(w, "  time: %s\n", res.Time.Format(time.RFC3339))
 		}
-		return "TIMEOUT"
-	}
-	defer conn.Close()
-
-	conn.SetReadDeadline(time.Now().Add(timeout))
-
-	buf := make([]byte, 255)
-	n, err := conn.Read(buf)
-	if err != nil {
-		if err == io.EOF {
-			return "ACTIVE_REJECT"
+	case []*HostStatus:
+		for _, h := range v {
+			fmt.Fprintf(w, "- host: %s\n", h.Host)
+			fmt.Fprintf(w, "  interval: %v\n", h.Interval)
+			fmt.Fprintf(w, "  timeout: %v\n", h.Timeout)
+			fmt.Fprintf(w, "  last_run: %s\n", h.LastRun.Format(time.RFC3339))
 		}
-		return "TIMEOUT"
+	default:
+		fmt.Fprintf(w, "message: %v\n", v)
 	}
-
-	data := string(buf[:n])
-	if sshPattern.MatchString(data) {
-		return "SSH"
-	}
-
-	return "ACTIVE_REJECT"
 }
 
-func isConnectionRefused(err error) bool {
-	return strings.Contains(err.Error(), "refused")
+func (s *Server) writePlainText(w io.Writer, data interface{}) {
+	switch v := data.(type) {
+	case []CheckResult:
+		for _, res := range v {
+			fmt.Fprintf(w, "[%s] %s -> %s\n", res.Time.Format("15:04:05"), res.Host, res.Status)
+		}
+	case []*HostStatus:
+		for _, h := range v {
+			fmt.Fprintf(w, "Host: %s, Interval: %v, Timeout: %v, Last: %v\n", h.Host, h.Interval, h.Timeout, h.LastRun.Format("15:04:05"))
+		}
+	default:
+		fmt.Fprintf(w, "%v\n", v)
+	}
 }
 
 func normalizeTarget(target string) string {
@@ -169,149 +516,4 @@ func normalizeTarget(target string) string {
 		return net.JoinHostPort(host, "22")
 	}
 	return target
-}
-
-// --- API Handlers ---
-
-func handleHosts(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		state.mu.RLock()
-		json.NewEncoder(w).Encode(state.Hosts)
-		state.mu.RUnlock()
-	
-	case http.MethodPost:
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
-			return
-		}
-		host := strings.TrimSpace(string(body))
-		if host == "" {
-			http.Error(w, "Empty host", http.StatusBadRequest)
-			return
-		}
-		host = normalizeTarget(host)
-
-		state.mu.Lock()
-		// Simple dedup
-		exists := false
-		for _, h := range state.Hosts {
-			if h == host {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			state.Hosts = append(state.Hosts, host)
-		}
-		state.mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Added " + host))
-
-	case http.MethodDelete:
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
-			return
-		}
-		host := strings.TrimSpace(string(body))
-		host = normalizeTarget(host)
-
-		state.mu.Lock()
-		newHosts := make([]string, 0, len(state.Hosts))
-		found := false
-		for _, h := range state.Hosts {
-			if h != host {
-				newHosts = append(newHosts, h)
-			} else {
-				found = true
-			}
-		}
-		state.Hosts = newHosts
-		state.mu.Unlock()
-
-		if found {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Removed " + host))
-		} else {
-			http.Error(w, "Host not found", http.StatusNotFound)
-		}
-
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func handleResults(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	query := r.URL.Query()
-	format := query.Get("format")
-	sinceStr := query.Get("since")
-	limitStr := query.Get("limit")
-
-	state.mu.RLock()
-	defer state.mu.RUnlock()
-
-	// Filter Logic
-	var filtered []RunResult
-	cutoff := time.Time{}
-
-	// Default: Last 6 hours
-	if sinceStr == "" && limitStr == "" {
-		cutoff = time.Now().Add(-6 * time.Hour)
-	} else if sinceStr != "" {
-		dur, err := time.ParseDuration(sinceStr)
-		if err == nil {
-			cutoff = time.Now().Add(-dur)
-		}
-	}
-
-	for _, run := range state.History {
-		if run.Time.After(cutoff) {
-			filtered = append(filtered, run)
-		}
-	}
-	
-	// Apply limit if specified (takes precedence over time filter? or applies to the filtered set?)
-	// "if request specified number of result ... it must respect"
-	if limitStr != "" {
-		var limit int
-		fmt.Sscanf(limitStr, "%d", &limit)
-		if limit > 0 && limit < len(filtered) {
-			// Get the *last* N results
-			filtered = filtered[len(filtered)-limit:]
-		}
-	}
-
-	// Output Formatting
-	switch format {
-	case "json":
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(filtered)
-	case "yaml":
-		w.Header().Set("Content-Type", "text/yaml")
-		// Manual YAML marshaling to avoid external deps
-		for _, run := range filtered {
-			fmt.Fprintf(w, "- time: %s\n", run.Time.Format(time.RFC3339))
-			fmt.Fprintf(w, "  results:\n")
-			for _, res := range run.Results {
-				fmt.Fprintf(w, "    - host: %s\n", res.Host)
-				fmt.Fprintf(w, "      status: %s\n", res.Status)
-			}
-		}
-	default: // Plain text
-		w.Header().Set("Content-Type", "text/plain")
-		for _, run := range filtered {
-			fmt.Fprintf(w, "Time: %s\n", run.Time.Format(time.RFC3339))
-			for _, res := range run.Results {
-				fmt.Fprintf(w, "  %s -> %s\n", res.Host, res.Status)
-			}
-			fmt.Fprintln(w, "--------------------------------------------------")
-		}
-	}
 }
