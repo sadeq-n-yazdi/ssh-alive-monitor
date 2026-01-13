@@ -52,6 +52,12 @@ type Config struct {
 	CertPath        string       `json:"cert_path"`
 	KeyPath         string       `json:"key_path"`
 	SSLCertDomains  []string     `json:"ssl_cert_domains"`
+	ACMEEnabled     bool         `json:"acme_enabled"`
+	ACMEProvider    string       `json:"acme_provider"` // "letsencrypt", "zerossl"
+	ACMEEmail       string       `json:"acme_email"`
+	ACMEChallenge   string       `json:"acme_challenge"` // "http", "dns"
+	DNSProvider     string       `json:"dns_provider"`   // "cloudflare", "manual"
+	ACMEDNSToken    string       `json:"acme_dns_token"` // For Cloudflare: API Token
 }
 
 func loadConfig(path string, config *Config) error {
@@ -93,6 +99,10 @@ func GetConfig() *Config {
 		CertPath:        "server.crt",
 		KeyPath:         "server.key",
 		SSLCertDomains:  []string{"localhost"},
+		ACMEEnabled:     false,
+		ACMEProvider:    "letsencrypt",
+		ACMEChallenge:   "http",
+		DNSProvider:     "manual",
 	}
 
 	loadConfig("config.json", cfg)

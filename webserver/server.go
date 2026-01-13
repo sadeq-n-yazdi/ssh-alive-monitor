@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -94,7 +95,18 @@ func main() {
 
 	go s.watchConfig()
 
+	// ACME Manager
+	acmeMgr := NewACMEManager(cfg, logger)
+	if cfg.ACMEEnabled {
+		acmeMgr.StartRenewalLoop()
+	}
+
 	mux := http.NewServeMux()
+
+	// ACME HTTP Challenge Handler
+	if cfg.ACMEEnabled && cfg.ACMEChallenge == "http" {
+		mux.HandleFunc("/.well-known/acme-challenge/", acmeMgr.HTTPHandler)
+	}
 
 	// API Keys Management (Master only)
 	mux.HandleFunc("/api/keys", s.auth.AuthMiddleware(s.handleKeys, KeyMaster))
@@ -153,6 +165,56 @@ func main() {
 
 	if cfg.SSLEnabled {
 		logger.Info("requests", "SSL Enabled. Checking certificates...")
+		
+		// Check ACME
+		if cfg.ACMEEnabled {
+			// If certs don't exist, try to obtain them
+			_, certErr := os.Stat(cfg.CertPath)
+			_, keyErr := os.Stat(cfg.KeyPath)
+			if os.IsNotExist(certErr) || os.IsNotExist(keyErr) {
+				// We need to serve HTTP for challenge if using HTTP-01
+				// But we are blocking here.
+				// For HTTP-01, we need to start the server in background if it's the same port/server.
+				// However, ListenAndServeTLS blocks.
+				// If we use HTTP-01, we must handle the challenge.
+				// If we are sharing the port, we can't easily start just for challenge unless we start HTTP first?
+				// Typically ACME HTTP-01 requires port 80. If our port is 8080 (forwarded), we can serve.
+				// We'll start a goroutine for the server IF we need to answer challenges while obtaining?
+				// No, obtaining blocks.
+				// If we use the `http01.NewProviderServer` from lego, it binds a port.
+				// But we are using `MyHTTPProvider` which just hooks into `acmeMgr.HTTPHandler`.
+				// This implies the server MUST be running.
+				// BUT we haven't started `srv.ListenAndServeTLS` yet.
+				// CHICKEN AND EGG PROBLEM for HTTP-01 on the same port if we want to upgrade to TLS later.
+				// Solution: Start a temporary HTTP server or start the main server in a goroutine?
+				// But main server wants TLS.
+				// If we are missing certs, we CANNOT start TLS.
+				// So we must start as HTTP first?
+				// But users expect TLS.
+				// ACME HTTP-01 strictly requires answering on HTTP (plain).
+				// So if we are enabled, we should probably start HTTP server first, obtain cert, then switch?
+				// Or simple: Start HTTP server logic just for the challenge duration if using `MyHTTPProvider`?
+				// But `srv` is configured for the app.
+				// Let's assume for HTTP-01, the user has a separate setup or we temporarily listen on HTTP.
+				
+				if cfg.ACMEChallenge == "http" {
+					logger.Info("requests", "Starting temporary HTTP server for ACME challenge...")
+					tempSrv := &http.Server{Addr: serverAddr, Handler: mux}
+					go tempSrv.ListenAndServe()
+					defer tempSrv.Close() // Close after obtaining?
+					// Wait a bit for server to be up
+					time.Sleep(1 * time.Second)
+				}
+				
+				if err := acmeMgr.ObtainCert(); err != nil {
+					logger.Error("requests", "Failed to obtain ACME certificate: %v", err)
+					// Fallback to self-signed?
+					logger.Info("requests", "Falling back to self-signed certificate generation...")
+				}
+			}
+		}
+
+		// Self-signed fallback check
 		_, certErr := os.Stat(cfg.CertPath)
 		_, keyErr := os.Stat(cfg.KeyPath)
 
@@ -165,8 +227,17 @@ func main() {
 			logger.Info("requests", "Self-signed certificate generated at %s and %s", cfg.CertPath, cfg.KeyPath)
 		}
 
+		// Initialize CertManager for hot reloading
+		certMgr := NewCertManager(cfg.CertPath, cfg.KeyPath, logger)
+		certMgr.StartWatcher()
+
+		srv.TLSConfig = &tls.Config{
+			GetCertificate: certMgr.GetCertificate,
+		}
+
 		logger.Info("requests", "Server starting on %s (HTTPS)", serverAddr)
-		if err := srv.ListenAndServeTLS(cfg.CertPath, cfg.KeyPath); err != nil {
+		// We use ListenAndServeTLS with empty strings because GetCertificate provides the certs
+		if err := srv.ListenAndServeTLS("", ""); err != nil {
 			logger.Error("requests", "Server failed: %v", err)
 		}
 	} else {
