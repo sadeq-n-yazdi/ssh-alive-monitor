@@ -48,6 +48,10 @@ type Config struct {
 	PredefinedHosts []string     `json:"predefined_hosts"`
 	Hosts           []HostConfig `json:"hosts"`
 	IPWhitelist     []string     `json:"ip_whitelist"`
+	SSLEnabled      bool         `json:"ssl_enabled"`
+	CertPath        string       `json:"cert_path"`
+	KeyPath         string       `json:"key_path"`
+	SSLCertDomains  []string     `json:"ssl_cert_domains"`
 }
 
 func loadConfig(path string, config *Config) error {
@@ -85,6 +89,10 @@ func GetConfig() *Config {
 		DefaultInterval: "10m",
 		DefaultTimeout:  "5s",
 		MasterKeys:      []string{"master-key-123"},
+		SSLEnabled:      false,
+		CertPath:        "server.crt",
+		KeyPath:         "server.key",
+		SSLCertDomains:  []string{"localhost"},
 	}
 
 	loadConfig("config.json", cfg)

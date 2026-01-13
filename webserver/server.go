@@ -2,11 +2,16 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -107,6 +112,11 @@ func main() {
 	mux.HandleFunc("/form/", s.auth.AuthMiddleware(s.handleForm, KeyNormal))
 
 	port := flag.String("port", cfg.Port, "Port to listen on")
+	sslEnabled := flag.Bool("ssl-enabled", cfg.SSLEnabled, "Enable SSL/TLS")
+	certPath := flag.String("cert-path", cfg.CertPath, "Path to SSL certificate")
+	keyPath := flag.String("key-path", cfg.KeyPath, "Path to SSL private key")
+	sslDomains := flag.String("ssl-cert-domains", "", "Comma-separated list of domains for self-signed cert")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "SSH Alive Monitor %s\n", Version)
 		fmt.Fprintf(os.Stderr, "Author: %s\n", Author)
@@ -121,17 +131,49 @@ func main() {
 	if *port != "" {
 		cfg.Port = *port
 	}
+	cfg.SSLEnabled = *sslEnabled
+	if *certPath != "" {
+		cfg.CertPath = *certPath
+	}
+	if *keyPath != "" {
+		cfg.KeyPath = *keyPath
+	}
+	if *sslDomains != "" {
+		cfg.SSLCertDomains = strings.Split(*sslDomains, ",")
+		for i := range cfg.SSLCertDomains {
+			cfg.SSLCertDomains[i] = strings.TrimSpace(cfg.SSLCertDomains[i])
+		}
+	}
 
-	serverAddr := ":" + *port
-	logger.Info("requests", "Server starting on %s", serverAddr)
-
+	serverAddr := ":" + cfg.Port
 	srv := &http.Server{
 		Addr:    serverAddr,
 		Handler: s.loggingMiddleware(mux),
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
-		logger.Error("requests", "Server failed: %v", err)
+	if cfg.SSLEnabled {
+		logger.Info("requests", "SSL Enabled. Checking certificates...")
+		_, certErr := os.Stat(cfg.CertPath)
+		_, keyErr := os.Stat(cfg.KeyPath)
+
+		if os.IsNotExist(certErr) || os.IsNotExist(keyErr) {
+			logger.Info("requests", "Certificate or key not found. Generating self-signed certificate for domains: %v", cfg.SSLCertDomains)
+			if err := generateSelfSignedCert(cfg.CertPath, cfg.KeyPath, cfg.SSLCertDomains); err != nil {
+				logger.Error("requests", "Failed to generate self-signed certificate: %v", err)
+				os.Exit(1)
+			}
+			logger.Info("requests", "Self-signed certificate generated at %s and %s", cfg.CertPath, cfg.KeyPath)
+		}
+
+		logger.Info("requests", "Server starting on %s (HTTPS)", serverAddr)
+		if err := srv.ListenAndServeTLS(cfg.CertPath, cfg.KeyPath); err != nil {
+			logger.Error("requests", "Server failed: %v", err)
+		}
+	} else {
+		logger.Info("requests", "Server starting on %s (HTTP)", serverAddr)
+		if err := srv.ListenAndServe(); err != nil {
+			logger.Error("requests", "Server failed: %v", err)
+		}
 	}
 }
 
@@ -768,4 +810,53 @@ func generateRandomKey(length int) string {
 		return ""
 	}
 	return hex.EncodeToString(b)
+}
+
+func generateSelfSignedCert(certPath, keyPath string, domains []string) error {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"SSH Monitor Self-Signed"},
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	for _, d := range domains {
+		if ip := net.ParseIP(d); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, d)
+		}
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return err
+	}
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		return err
+	}
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	certOut.Close()
+
+	keyOut, err := os.Create(keyPath)
+	if err != nil {
+		return err
+	}
+	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	keyOut.Close()
+
+	return nil
 }
