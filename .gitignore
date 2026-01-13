@@ -1,3 +1,12 @@
+config-override.json  
+server.crt            
+ssh-monitor           
+webserver/ssh-monitor
+config.json 
+config-override.json 
+server.key            
+webserver/go.sum
+
 # Created by https://www.toptal.com/developers/gitignore/api/python,linux,pycharm,visualstudio,macos,windows
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,linux,pycharm,visualstudio,macos,windows
 
