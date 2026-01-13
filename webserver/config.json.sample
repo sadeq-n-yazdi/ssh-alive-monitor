@@ -9,8 +9,18 @@
     "log_format": "color",
     "default_interval": "10m",
     "default_timeout": "5s",
+    "ssl_enabled": false,
+    "cert_path": "server.crt",
+    "key_path": "server.key",
+    "ssl_cert_domains": ["localhost"],
+    "acme_enabled": false,
+    "acme_provider": "letsencrypt",
+    "acme_email": "your-email@example.com",
+    "acme_challenge": "http",
+    "dns_provider": "manual",
+    "acme_dns_token": "",
     "master_keys": [
-        "YOUR_MASTER_KEY_HERE"
+        "CHANGE-ME-MASTER-KEY-1"
     ],
     "normal_keys": [],
     "predefined_hosts": [
