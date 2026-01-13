@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -921,27 +922,50 @@ func generateSelfSignedCert(certPath, keyPath string, domains []string) error {
 		return fmt.Errorf("failed to create certificate: %w", err)
 	}
 
-	certOut, err := os.Create(certPath)
+	// Create temp files in the same directory as target files to ensure atomic rename
+	certDir := filepath.Dir(certPath)
+	certTmp, err := os.CreateTemp(certDir, "cert-*.tmp")
 	if err != nil {
-		return fmt.Errorf("failed to open cert file for writing: %w", err)
+		return fmt.Errorf("failed to create temp cert file: %w", err)
 	}
-	defer certOut.Close()
-	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+	certTmpName := certTmp.Name()
+	defer os.Remove(certTmpName) // Clean up if not renamed successfully
+
+	if err := pem.Encode(certTmp, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+		certTmp.Close()
 		return fmt.Errorf("failed to write data to cert file: %w", err)
 	}
-
-	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to open key file for writing: %w", err)
+	if err := certTmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temp cert file: %w", err)
 	}
-	defer keyOut.Close()
+
+	keyDir := filepath.Dir(keyPath)
+	keyTmp, err := os.CreateTemp(keyDir, "key-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp key file: %w", err)
+	}
+	keyTmpName := keyTmp.Name()
+	defer os.Remove(keyTmpName) // Clean up if not renamed successfully
 
 	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
+		keyTmp.Close()
 		return fmt.Errorf("failed to marshal private key: %w", err)
 	}
-	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
+	if err := pem.Encode(keyTmp, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
+		keyTmp.Close()
 		return fmt.Errorf("failed to write data to key file: %w", err)
+	}
+	if err := keyTmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temp key file: %w", err)
+	}
+
+	// Now rename both files
+	if err := os.Rename(certTmpName, certPath); err != nil {
+		return fmt.Errorf("failed to rename cert file: %w", err)
+	}
+	if err := os.Rename(keyTmpName, keyPath); err != nil {
+		return fmt.Errorf("failed to rename key file: %w", err)
 	}
 
 	return nil
