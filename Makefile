@@ -23,4 +23,9 @@ deploy: compress
 	rm $(BINARY_TMP)
 
 clean:
-	rm -f $(BINARY_NAME) $(BINARY_TMP)
+	rm -f $(BINARY_NAME) $(BINARY_NAME).tmp \
+		ssh-alive-check \
+		webserver/ssh-monitor webserver/ssh-alive-monitor \
+		go-cli/ssh-alive-check 
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
