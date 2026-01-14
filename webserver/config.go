@@ -35,32 +35,40 @@ type HostConfig struct {
 	Public   bool   `json:"public,omitempty"`
 }
 
+type NetworkRangeConfig struct {
+	CIDR     string `json:"cidr"`
+	Interval string `json:"interval,omitempty"`
+	Timeout  string `json:"timeout,omitempty"`
+	Public   bool   `json:"public,omitempty"`
+}
+
 type Config struct {
-	Port                 string       `json:"port"`
-	LogLevel             string       `json:"log_level"`
-	LogComponents        []string     `json:"log_components"`
-	LogColor             bool         `json:"log_color"`
-	LogFormat            string       `json:"log_format"` // "text", "json", "color"
-	DefaultInterval      string       `json:"default_interval"`
-	DefaultTimeout       string       `json:"default_timeout"`
-	CheckPoolSize        int          `json:"check_pool_size"`
-	MaxSubnetConcurrency int          `json:"max_subnet_concurrency"`
-	HistoryLimit         int          `json:"history_limit"`
-	MasterKeys           []string     `json:"master_keys"`
-	NormalKeys           []string     `json:"normal_keys"`
-	PredefinedHosts      []string     `json:"predefined_hosts"`
-	Hosts                []HostConfig `json:"hosts"`
-	IPWhitelist          []string     `json:"ip_whitelist"`
-	SSLEnabled           bool         `json:"ssl_enabled"`
-	CertPath             string       `json:"cert_path"`
-	KeyPath              string       `json:"key_path"`
-	SSLCertDomains       []string     `json:"ssl_cert_domains"`
-	ACMEEnabled          bool         `json:"acme_enabled"`
-	ACMEProvider         string       `json:"acme_provider"` // "letsencrypt", "zerossl"
-	ACMEEmail            string       `json:"acme_email"`
-	ACMEChallenge        string       `json:"acme_challenge"` // "http", "dns"
-	DNSProvider          string       `json:"dns_provider"`   // "cloudflare", "manual"
-	ACMEDNSToken         string       `json:"acme_dns_token"` // For Cloudflare: API Token
+	Port                 string               `json:"port"`
+	LogLevel             string               `json:"log_level"`
+	LogComponents        []string             `json:"log_components"`
+	LogColor             bool                 `json:"log_color"`
+	LogFormat            string               `json:"log_format"` // "text", "json", "color"
+	DefaultInterval      string               `json:"default_interval"`
+	DefaultTimeout       string               `json:"default_timeout"`
+	CheckPoolSize        int                  `json:"check_pool_size"`
+	MaxSubnetConcurrency int                  `json:"max_subnet_concurrency"`
+	HistoryLimit         int                  `json:"history_limit"`
+	MasterKeys           []string             `json:"master_keys"`
+	NormalKeys           []string             `json:"normal_keys"`
+	PredefinedHosts      []string             `json:"predefined_hosts"`
+	Hosts                []HostConfig         `json:"hosts"`
+	NetworkRanges        []NetworkRangeConfig `json:"network_ranges"`
+	IPWhitelist          []string             `json:"ip_whitelist"`
+	SSLEnabled           bool                 `json:"ssl_enabled"`
+	CertPath             string               `json:"cert_path"`
+	KeyPath              string               `json:"key_path"`
+	SSLCertDomains       []string             `json:"ssl_cert_domains"`
+	ACMEEnabled          bool                 `json:"acme_enabled"`
+	ACMEProvider         string               `json:"acme_provider"` // "letsencrypt", "zerossl"
+	ACMEEmail            string               `json:"acme_email"`
+	ACMEChallenge        string               `json:"acme_challenge"` // "http", "dns"
+	DNSProvider          string               `json:"dns_provider"`   // "cloudflare", "manual"
+	ACMEDNSToken         string               `json:"acme_dns_token"` // For Cloudflare: API Token
 }
 
 func loadConfig(path string, config *Config) error {

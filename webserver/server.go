@@ -82,6 +82,31 @@ func main() {
 		monitor.AddHost(normalizeTarget(hc.Host), interval, timeout, hc.Public)
 	}
 
+	// Add hosts from configured network ranges
+	for _, nr := range cfg.NetworkRanges {
+		interval := defaultInterval
+		if nr.Interval != "" {
+			if d, err := time.ParseDuration(nr.Interval); err == nil {
+				interval = d
+			}
+		}
+		timeout := defaultTimeout
+		if nr.Timeout != "" {
+			if d, err := time.ParseDuration(nr.Timeout); err == nil {
+				timeout = d
+			}
+		}
+
+		ips, err := expandCIDR(nr.CIDR)
+		if err == nil {
+			for _, ip := range ips {
+				monitor.AddHost(normalizeTarget(ip), interval, timeout, nr.Public)
+			}
+		} else {
+			logger.Error("config", "Failed to expand network range %s: %v", nr.CIDR, err)
+		}
+	}
+
 	monitor.Start()
 
 	initialHash, _ := getFilesHash([]string{"config.json", "config-override.json"})
@@ -114,6 +139,7 @@ func main() {
 
 	// Hosts Management (Master can do everything, Normal can add/remove/change)
 	mux.HandleFunc("/api/hosts", s.auth.AuthMiddleware(s.handleHosts, KeyNormal))
+	mux.HandleFunc("/api/ranges", s.auth.AuthMiddleware(s.handleRanges, KeyNormal))
 
 	// Results (Normal and Master)
 	mux.HandleFunc("/api/results", s.handleResults)
@@ -342,6 +368,31 @@ func (s *Server) applyConfig(cfg *Config) {
 		s.monitor.AddHost(normalizeTarget(hc.Host), interval, timeout, hc.Public)
 	}
 
+	// Add hosts from configured network ranges
+	for _, nr := range cfg.NetworkRanges {
+		interval := defaultInterval
+		if nr.Interval != "" {
+			if d, err := time.ParseDuration(nr.Interval); err == nil {
+				interval = d
+			}
+		}
+		timeout := defaultTimeout
+		if nr.Timeout != "" {
+			if d, err := time.ParseDuration(nr.Timeout); err == nil {
+				timeout = d
+			}
+		}
+
+		ips, err := expandCIDR(nr.CIDR)
+		if err == nil {
+			for _, ip := range ips {
+				s.monitor.AddHost(normalizeTarget(ip), interval, timeout, nr.Public)
+			}
+		} else {
+			s.logger.Error("config", "Failed to expand network range %s: %v", nr.CIDR, err)
+		}
+	}
+
 	s.logger.Info("requests", "Configuration reloaded successfully")
 }
 
@@ -464,6 +515,66 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleRanges(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("requests", "Range management: %s %s", r.Method, r.URL.Path)
+	switch r.Method {
+	case http.MethodGet:
+		s.respond(w, r, s.config.NetworkRanges)
+
+	case http.MethodDelete:
+		// Delete a range
+		// Expect 'cidr' in body or query
+		var cidr string
+		if r.Body != nil && r.ContentLength > 0 {
+			body, _ := io.ReadAll(r.Body)
+			cidr = strings.TrimSpace(string(body))
+		}
+		if cidr == "" {
+			cidr = r.URL.Query().Get("cidr")
+		}
+
+		if cidr == "" {
+			http.Error(w, "CIDR is required", http.StatusBadRequest)
+			return
+		}
+
+		// Find and remove from config
+		found := false
+		var newRanges []NetworkRangeConfig
+		for _, nr := range s.config.NetworkRanges {
+			if nr.CIDR == cidr {
+				found = true
+				continue
+			}
+			newRanges = append(newRanges, nr)
+		}
+
+		if !found {
+			http.Error(w, "Range not found", http.StatusNotFound)
+			return
+		}
+
+		s.config.NetworkRanges = newRanges
+		s.saveConfig()
+
+		// Remove IPs from monitor
+		ips, err := expandCIDR(cidr)
+		removedCount := 0
+		if err == nil {
+			for _, ip := range ips {
+				host := normalizeTarget(ip)
+				s.monitor.RemoveHost(host)
+				removedCount++
+			}
+		}
+
+		s.respond(w, r, map[string]interface{}{"message": "Range removed", "cidr": cidr, "hosts_removed": removedCount})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	// For GET /api/hosts, we only show all hosts if authenticated.
 	// However, AuthMiddleware is already applied to /api/hosts for KeyNormal.
@@ -559,6 +670,16 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 				s.monitor.AddHost(host, interval, timeout, false)
 				count++
 			}
+
+			// Persistence for Network Ranges
+			s.config.NetworkRanges = append(s.config.NetworkRanges, NetworkRangeConfig{
+				CIDR:     req.Host,
+				Interval: req.Interval,
+				Timeout:  req.Timeout,
+				Public:   false,
+			})
+			s.saveConfig()
+
 			s.respond(w, r, map[string]interface{}{"message": fmt.Sprintf("Added %d hosts from CIDR", count), "cidr": req.Host, "count": count})
 
 		} else {
