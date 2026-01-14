@@ -2,6 +2,14 @@
 
 # Test script for SSL Certificate Generation and HTTPS Support
 
+# Get absolute path to project root
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+WEBSERVER_DIR="$ROOT_DIR/webserver"
+
+# Ensure we are in the root directory for consistency
+cd "$ROOT_DIR"
+
 PORT=8443
 API_URL="https://localhost:$PORT"
 MASTER_KEY="master-key-123"
@@ -11,13 +19,13 @@ KEY_FILE="test_server.key"
 CONFIG_FILE="test_config_ssl.json"
 
 echo "Building webserver..."
-cd webserver
+cd "$WEBSERVER_DIR"
 go build -o ssh-monitor .
 if [ $? -ne 0 ]; then
     echo "Build failed!"
     exit 1
 fi
-cd ..
+cd "$ROOT_DIR"
 
 # Create a test config
 cat <<EOF > $CONFIG_FILE

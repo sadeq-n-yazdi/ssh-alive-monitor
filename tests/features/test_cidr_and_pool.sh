@@ -1,15 +1,23 @@
 #!/bin/bash
 
+# Get absolute path to project root
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+WEBSERVER_DIR="$ROOT_DIR/webserver"
+
+# Ensure we are in the root directory for consistency
+cd "$ROOT_DIR"
+
 # Port to run the server on
 PORT=8083
 API_URL="http://localhost:$PORT"
 MASTER_KEY="master-key-123"
 
 # Cleanup previous run
-rm -f webserver/ssh-monitor
+rm -f "$WEBSERVER_DIR/ssh-monitor"
 
 echo "Building webserver..."
-cd webserver
+cd "$WEBSERVER_DIR"
 go build -o ssh-monitor
 if [ $? -ne 0 ]; then
     echo "Build failed!"
