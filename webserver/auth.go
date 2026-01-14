@@ -75,14 +75,14 @@ func (am *AuthManager) GetAuthFromRequest(r *http.Request) (APIKey, bool) {
 	return APIKey{}, false
 }
 
-func (am *AuthManager) SetAuthCookie(w http.ResponseWriter, key string) {
+func (am *AuthManager) SetAuthCookie(w http.ResponseWriter, key string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     AuthCookieName,
 		Value:    key,
 		Path:     "/",
 		HttpOnly: true,
-		// Secure:   true, // Should be true if using SSL, but we support both
-		Expires: time.Now().Add(24 * time.Hour),
+		Secure:   secure,
+		Expires:  time.Now().Add(24 * time.Hour),
 	})
 }
 
@@ -145,7 +145,7 @@ func (am *AuthManager) AuthMiddleware(next http.HandlerFunc, minType APIKeyType)
 		// For simplicity, let's set it if missing or different.
 		currentCookie, err := r.Cookie(AuthCookieName)
 		if err != nil || currentCookie.Value != apiKey.Key {
-			am.SetAuthCookie(w, apiKey.Key)
+			am.SetAuthCookie(w, apiKey.Key, r.TLS != nil)
 		}
 
 		if minType == KeyMaster && apiKey.Type != KeyMaster {
