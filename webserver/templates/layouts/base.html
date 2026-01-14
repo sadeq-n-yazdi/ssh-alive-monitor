@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}} - SSH Monitor</title>
+
+    <!-- Tailwind CSS + DaisyUI -->
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.6.0/dist/full.min.css" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- htmx -->
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10/dist/ext/json-enc.js"></script>
+
+    <!-- Alpine.js -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.5/dist/cdn.min.js"></script>
+
+    <!-- Custom styles -->
+    <style>
+        [x-cloak] { display: none !important; }
+        .htmx-swapping { opacity: 0; transition: opacity 200ms ease-out; }
+        .htmx-added { opacity: 0; }
+        .htmx-settling { opacity: 1; transition: opacity 200ms ease-in; }
+    </style>
+</head>
+<body class="bg-base-200 min-h-screen">
+    {{template "header" .}}
+
+    <main class="container mx-auto px-4 py-8">
+        {{template "content" .}}
+    </main>
+
+    <!-- Toast notifications container -->
+    <div id="toast-container" class="toast toast-end" x-data="toastManager()" @show-toast.window="show($event.detail)">
+        <template x-for="toast in toasts" :key="toast.id">
+            <div class="alert" :class="{
+                'alert-success': toast.type === 'success',
+                'alert-error': toast.type === 'error',
+                'alert-warning': toast.type === 'warning',
+                'alert-info': toast.type === 'info'
+            }" x-show="toast.visible" x-transition>
+                <span x-text="toast.message"></span>
+            </div>
+        </template>
+    </div>
+
+    <!-- WebSocket Client -->
+    <script src="/static/js/websocket.js"></script>
+
+    <!-- Alpine.js Components -->
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

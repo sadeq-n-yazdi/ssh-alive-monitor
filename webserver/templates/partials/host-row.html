@@ -1,0 +1,110 @@
+{{define "host-row"}}
+<tr data-host="{{.Host}}" class="hover">
+    <td>
+        <div class="flex items-center gap-2">
+            <div class="avatar placeholder">
+                <div class="rounded-full w-8 h-8 flex items-center justify-center
+                    {{if eq .Status "SSH"}}bg-success text-success-content
+                    {{else if eq .Status "TIMEOUT"}}bg-error text-error-content
+                    {{else if eq .Status "ACTIVE_REJECT"}}bg-warning text-warning-content
+                    {{else if eq .Status "PROTOCOL_MISMATCH"}}bg-info text-info-content
+                    {{else}}bg-neutral text-neutral-content
+                    {{end}}">
+                    {{if eq .Status "SSH"}}
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                    </svg>
+                    {{else if eq .Status "TIMEOUT"}}
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                    {{else}}
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    {{end}}
+                </div>
+            </div>
+            <div>
+                <div class="font-bold">{{.Host}}</div>
+                {{if .Public}}
+                <div class="badge badge-ghost badge-xs">public</div>
+                {{end}}
+            </div>
+        </div>
+    </td>
+    <td>
+        <div class="status-badge badge"
+             {{if eq .Status "SSH"}}class="badge badge-success"
+             {{else if eq .Status "TIMEOUT"}}class="badge badge-error"
+             {{else if eq .Status "ACTIVE_REJECT"}}class="badge badge-warning"
+             {{else if eq .Status "PROTOCOL_MISMATCH"}}class="badge badge-info"
+             {{else}}class="badge badge-ghost"
+             {{end}}>
+            {{.Status}}
+        </div>
+    </td>
+    <td>
+        <span class="last-run font-mono text-sm">{{.LastRun}}</span>
+    </td>
+    <td>
+        <span class="badge badge-outline badge-sm">{{.Interval}}</span>
+    </td>
+    <td>
+        <span class="badge badge-outline badge-sm">{{.Timeout}}</span>
+    </td>
+    <td>
+        {{if .Public}}
+        <div class="badge badge-success badge-sm">Public</div>
+        {{else}}
+        <div class="badge badge-ghost badge-sm">Private</div>
+        {{end}}
+    </td>
+    {{if .IsAuthenticated}}
+    <td class="text-right">
+        <div class="dropdown dropdown-end">
+            <label tabindex="0" class="btn btn-ghost btn-xs">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
+                </svg>
+            </label>
+            <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+                <li>
+                    <a hx-post="/api/hosts/check"
+                       hx-vals='{"host": "{{.Host}}"}'
+                       hx-swap="none"
+                       hx-indicator="#loading-{{.Host}}">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                        Check Now
+                    </a>
+                </li>
+                <li>
+                    <a onclick="editHostModal.showModal()" data-host="{{.Host}}" data-interval="{{.Interval}}" data-timeout="{{.Timeout}}" data-public="{{.Public}}">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                        Edit
+                    </a>
+                </li>
+                <li>
+                    <a hx-delete="/api/hosts"
+                       hx-vals='{"host": "{{.Host}}"}'
+                       hx-confirm="Are you sure you want to remove {{.Host}} from monitoring?"
+                       hx-target="closest tr"
+                       hx-swap="outerHTML swap:500ms"
+                       class="text-error">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        Delete
+                    </a>
+                </li>
+            </ul>
+        </div>
+        <span id="loading-{{.Host}}" class="loading loading-spinner loading-xs htmx-indicator"></span>
+    </td>
+    {{end}}
+</tr>
+{{end}}

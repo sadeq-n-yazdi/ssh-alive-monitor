@@ -69,6 +69,12 @@ type Config struct {
 	ACMEChallenge        string               `json:"acme_challenge"` // "http", "dns"
 	DNSProvider          string               `json:"dns_provider"`   // "cloudflare", "manual"
 	ACMEDNSToken         string               `json:"acme_dns_token"` // For Cloudflare: API Token
+
+	// WebSocket Configuration
+	WSPingInterval string `json:"ws_ping_interval"` // Default: "30s"
+	WSMaxFailures  int    `json:"ws_max_failures"`  // Default: 3
+	WSReadTimeout  string `json:"ws_read_timeout"`  // Default: "60s"
+	WSWriteTimeout string `json:"ws_write_timeout"` // Default: "10s"
 }
 
 func loadConfig(path string, config *Config) error {
@@ -117,6 +123,12 @@ func GetConfig() *Config {
 		ACMEProvider:         "letsencrypt",
 		ACMEChallenge:        "http",
 		DNSProvider:          "manual",
+
+		// WebSocket defaults
+		WSPingInterval: "30s",
+		WSMaxFailures:  3,
+		WSReadTimeout:  "60s",
+		WSWriteTimeout: "10s",
 	}
 
 	loadConfig("config.json", cfg)
