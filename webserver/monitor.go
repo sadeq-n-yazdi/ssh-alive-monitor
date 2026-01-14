@@ -36,6 +36,7 @@ type Monitor struct {
 	mu              sync.RWMutex
 	logger          *Logger
 	stop            chan struct{}
+	hub             *Hub
 }
 
 func NewMonitor(logger *Logger, poolSize int, subnetLimit int, historyLimit int) *Monitor {
@@ -182,8 +183,18 @@ func (m *Monitor) executeCheck(h *HostStatus, subnet string) {
 
 	m.logger.Info("checks", "Check result for %s: %s", h.Host, status)
 
+	// Broadcast to WebSocket clients
+	if m.hub != nil {
+		m.hub.BroadcastHostUpdate(result)
+	}
+
 	// Trigger processing of next jobs
 	m.processPending()
+}
+
+// SetHub sets the WebSocket hub for real-time updates
+func (m *Monitor) SetHub(hub *Hub) {
+	m.hub = hub
 }
 
 func getSubnet(host string) string {

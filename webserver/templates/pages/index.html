@@ -1,0 +1,63 @@
+{{define "content"}}
+<div class="space-y-6">
+    <!-- Page header -->
+    <div class="flex justify-between items-center">
+        <div>
+            <h1 class="text-3xl font-bold">SSH Status Dashboard</h1>
+            <p class="text-base-content/70 mt-1">Real-time monitoring of SSH service availability</p>
+        </div>
+
+        <div class="stats shadow">
+            <div class="stat place-items-center">
+                <div class="stat-title">Total Hosts</div>
+                <div class="stat-value text-primary">{{.Stats.Total}}</div>
+            </div>
+            <div class="stat place-items-center">
+                <div class="stat-title">Online</div>
+                <div class="stat-value text-success">{{.Stats.Online}}</div>
+            </div>
+            <div class="stat place-items-center">
+                <div class="stat-title">Offline</div>
+                <div class="stat-value text-error">{{.Stats.Offline}}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Filter controls -->
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <div class="flex gap-4 items-center flex-wrap" x-data="{ filter: 'all' }">
+                <div class="form-control">
+                    <label class="label cursor-pointer gap-2">
+                        <span class="label-text">Show:</span>
+                    </label>
+                </div>
+                <div class="join">
+                    <input class="join-item btn btn-sm" type="radio" name="filter" aria-label="All" checked x-model="filter" value="all" />
+                    <input class="join-item btn btn-sm" type="radio" name="filter" aria-label="Online" x-model="filter" value="online" />
+                    <input class="join-item btn btn-sm" type="radio" name="filter" aria-label="Offline" x-model="filter" value="offline" />
+                </div>
+
+                <div class="form-control flex-1">
+                    <input type="text" id="host-search" placeholder="Search hosts..." class="input input-bordered input-sm w-full max-w-xs" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Host table -->
+    {{template "host-table" .}}
+
+    {{if .IsAuthenticated}}
+    <!-- Quick actions for authenticated users -->
+    <div class="flex gap-4 justify-end">
+        <a href="/form/" class="btn btn-primary">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+            </svg>
+            Manage Hosts
+        </a>
+    </div>
+    {{end}}
+</div>
+{{end}}

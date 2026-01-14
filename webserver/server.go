@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -39,6 +42,8 @@ type Server struct {
 	logger      *Logger
 	auth        *AuthManager
 	monitor     *Monitor
+	hub         *Hub
+	templates   *TemplateManager
 	currentHash string
 }
 
@@ -57,6 +62,15 @@ func main() {
 
 	auth := NewAuthManager(cfg)
 	monitor := NewMonitor(logger, cfg.CheckPoolSize, cfg.MaxSubnetConcurrency, cfg.HistoryLimit)
+
+	// Initialize template manager
+	templateMgr := NewTemplateManager()
+
+	// Initialize WebSocket hub
+	hub := NewHub(monitor, logger, cfg)
+
+	// Set hub on monitor for broadcasting
+	monitor.SetHub(hub)
 
 	// Add predefined hosts from simple list
 	defaultInterval, _ := time.ParseDuration(cfg.DefaultInterval)
@@ -116,6 +130,8 @@ func main() {
 		logger:      logger,
 		auth:        auth,
 		monitor:     monitor,
+		hub:         hub,
+		templates:   templateMgr,
 		currentHash: initialHash,
 	}
 
@@ -144,12 +160,28 @@ func main() {
 	// Results (Normal and Master)
 	mux.HandleFunc("/api/results", s.handleResults)
 
+	// Debug endpoints (no auth required for diagnostics)
+	mux.HandleFunc("/api/debug/hosts", s.handleDebugHosts)
+	mux.HandleFunc("/api/debug/ranges", s.handleDebugRanges)
+	mux.HandleFunc("/api/debug/config", s.handleDebugConfig)
+
 	// Index page
 	mux.HandleFunc("/", s.handleIndex)
 
 	// Form interface
 	mux.HandleFunc("/form/", s.auth.AuthMiddleware(s.handleForm, KeyNormal))
 	mux.HandleFunc("/logout", s.handleLogout)
+
+	// WebSocket endpoint
+	mux.HandleFunc("/ws", s.handleWebSocket)
+
+	// Debug endpoints
+	mux.HandleFunc("/debug/test-websocket", s.auth.AuthMiddleware(s.handleDebugTestWebSocket, KeyMaster))
+	mux.HandleFunc("/debug/websocket-status", s.auth.AuthMiddleware(s.handleDebugWebSocketStatus, KeyMaster))
+
+	// Static file serving from embedded FS
+	staticFS := http.FileServer(http.FS(GetEmbeddedFS()))
+	mux.Handle("/static/", http.StripPrefix("/static/", staticFS))
 
 	port := flag.String("port", cfg.Port, "Port to listen on")
 	sslEnabled := flag.Bool("ssl-enabled", cfg.SSLEnabled, "Enable SSL/TLS")
@@ -454,13 +486,24 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var req struct {
-			Key      string     `json:"key"`
-			Type     APIKeyType `json:"type"`
-			Generate bool       `json:"generate"`
+			Key         string     `json:"key"`
+			Type        APIKeyType `json:"type"`
+			Generate    bool       `json:"generate"`
+			Description string     `json:"description"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+
+		// Handle form data from htmx
+		contentType := r.Header.Get("Content-Type")
+		if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+			r.ParseForm()
+			req.Type = APIKeyType(r.FormValue("type"))
+			req.Description = r.FormValue("description")
+			req.Generate = true
+		} else {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 
 		if req.Generate {
@@ -481,10 +524,82 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		s.config.NormalKeys = s.auth.GetKeysByType(KeyNormal)
 		s.saveConfig()
 
-		s.respond(w, r, map[string]string{"message": "Key added", "key": req.Key})
+		// For htmx, return HTML to display the new key
+		if s.isHtmxRequest(r) {
+			w.Header().Set("Content-Type", "text/html")
+			keyTypeDisplay := "Normal"
+			keyTypeBadge := "badge-info"
+			if req.Type == KeyMaster {
+				keyTypeDisplay = "Master"
+				keyTypeBadge = "badge-error"
+			}
+
+			fmt.Fprintf(w, `<div class="alert alert-success">
+				<svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+				</svg>
+				<div>
+					<h3 class="font-bold">Key Generated Successfully</h3>
+					<div class="text-sm space-y-2">
+						<p>Save this key - it won't be shown again!</p>
+						<div class="flex items-center gap-2 mt-2">
+							<code class="badge badge-lg font-mono">%s</code>
+							<button class="btn btn-ghost btn-xs"
+								onclick="navigator.clipboard.writeText('%s'); showToast('Copied to clipboard', 'success')">
+								<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+								</svg>
+								Copy
+							</button>
+						</div>
+					</div>
+				</div>
+			</div>
+			<tr data-key="%s" hx-swap-oob="beforeend:#api-keys-list">
+				<td><code class="badge badge-lg font-mono">%s</code></td>
+				<td><div class="badge %s">%s</div></td>
+				<td><div class="badge badge-success">Active</div></td>
+				<td><span class="text-sm text-base-content/70">%s</span></td>
+				<td class="text-right">
+					<button class="btn btn-ghost btn-xs"
+						onclick="navigator.clipboard.writeText('%s'); showToast('Copied to clipboard', 'success')">
+						<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+						</svg>
+						Copy
+					</button>
+					<button class="btn btn-ghost btn-xs text-error"
+						hx-delete="/api/keys"
+						hx-vals='{"key": "%s"}'
+						hx-confirm="Are you sure you want to revoke this key?"
+						hx-target="closest tr"
+						hx-swap="outerHTML swap:500ms">
+						<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+						</svg>
+						Revoke
+					</button>
+				</td>
+			</tr>`, req.Key, req.Key, req.Key, req.Key, keyTypeBadge, keyTypeDisplay, req.Description, req.Key, req.Key)
+		} else {
+			s.respond(w, r, map[string]string{"message": "Key added", "key": req.Key})
+		}
 
 	case http.MethodDelete:
-		key := r.URL.Query().Get("key")
+		var key string
+
+		// Handle both query params and JSON body
+		if r.URL.Query().Get("key") != "" {
+			key = r.URL.Query().Get("key")
+		} else {
+			var req struct {
+				Key string `json:"key"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+				key = req.Key
+			}
+		}
+
 		if key == "" {
 			http.Error(w, "Key is required", http.StatusBadRequest)
 			return
@@ -496,7 +611,12 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		s.config.NormalKeys = s.auth.GetKeysByType(KeyNormal)
 		s.saveConfig()
 
-		s.respond(w, r, map[string]string{"message": "Key deleted"})
+		// For htmx, return empty response (row will be swapped out)
+		if s.isHtmxRequest(r) {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			s.respond(w, r, map[string]string{"message": "Key deleted"})
+		}
 
 	case http.MethodPatch:
 		var req struct {
@@ -521,35 +641,205 @@ func (s *Server) handleRanges(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.respond(w, r, s.config.NetworkRanges)
 
+	case http.MethodPost:
+		s.logger.Info("requests", "=== POST /api/ranges called ===")
+		s.logger.Info("requests", "POST ranges Content-Type: %s", r.Header.Get("Content-Type"))
+
+		var req struct {
+			CIDR     string `json:"cidr"`
+			Interval string `json:"interval"`
+			Timeout  string `json:"timeout"`
+			Public   bool   `json:"public"`
+		}
+
+		// Read body for logging
+		body, _ := io.ReadAll(r.Body)
+		s.logger.Info("requests", "POST ranges body: %q", string(body))
+
+		// Handle both form data and JSON
+		contentType := r.Header.Get("Content-Type")
+		if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+			values, err := url.ParseQuery(string(body))
+			if err == nil {
+				req.CIDR = values.Get("cidr")
+				req.Interval = values.Get("interval")
+				req.Timeout = values.Get("timeout")
+				req.Public = values.Get("public") == "on"
+				s.logger.Info("requests", "POST ranges from form: cidr=%q interval=%q timeout=%q public=%v", req.CIDR, req.Interval, req.Timeout, req.Public)
+			} else {
+				s.logger.Warning("requests", "POST ranges form parse error: %v", err)
+				http.Error(w, "Invalid form data: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		} else {
+			// Parse JSON
+			if err := json.Unmarshal(body, &req); err != nil {
+				s.logger.Warning("requests", "POST ranges JSON decode error: %v", err)
+				http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			s.logger.Info("requests", "POST ranges from JSON: cidr=%q interval=%q timeout=%q public=%v", req.CIDR, req.Interval, req.Timeout, req.Public)
+		}
+
+		if req.CIDR == "" {
+			s.logger.Warning("requests", "POST ranges: CIDR is empty")
+			http.Error(w, "CIDR is required", http.StatusBadRequest)
+			return
+		}
+
+		// Validate CIDR
+		_, ipNet, err := net.ParseCIDR(req.CIDR)
+		if err != nil {
+			s.logger.Warning("requests", "POST ranges: Invalid CIDR %q: %v", req.CIDR, err)
+			http.Error(w, "Invalid CIDR format: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Check size limits
+		ones, bits := ipNet.Mask.Size()
+		if bits-ones > 16 {
+			http.Error(w, "CIDR range is too large. Maximum allowed range size is /16.", http.StatusBadRequest)
+			return
+		}
+
+		interval, _ := time.ParseDuration(req.Interval)
+		if interval == 0 {
+			interval, _ = time.ParseDuration(s.config.DefaultInterval)
+		}
+		timeout, _ := time.ParseDuration(req.Timeout)
+		if timeout == 0 {
+			timeout, _ = time.ParseDuration(s.config.DefaultTimeout)
+		}
+
+		// Expand CIDR and add hosts
+		ips, err := expandCIDR(req.CIDR)
+		if err != nil {
+			http.Error(w, "Failed to expand CIDR: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		count := 0
+		for _, ip := range ips {
+			host := normalizeTarget(ip)
+			s.monitor.AddHost(host, interval, timeout, req.Public)
+			count++
+		}
+
+		// Add to config
+		s.config.NetworkRanges = append(s.config.NetworkRanges, NetworkRangeConfig{
+			CIDR:     req.CIDR,
+			Interval: req.Interval,
+			Timeout:  req.Timeout,
+			Public:   req.Public,
+		})
+		s.saveConfig()
+
+		// For htmx, return the range card HTML
+		if s.isHtmxRequest(r) {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, `<div class="card bg-base-200" data-cidr="%s">
+				<div class="card-body">
+					<div class="flex justify-between items-start">
+						<div class="flex-1">
+							<h3 class="font-bold text-lg">%s</h3>
+							<div class="flex gap-2 mt-2 flex-wrap">
+								<div class="badge badge-outline">Interval: %s</div>
+								<div class="badge badge-outline">Timeout: %s</div>
+								%s
+							</div>
+						</div>
+						<button class="btn btn-ghost btn-sm text-error"
+							hx-delete="/api/ranges"
+							hx-vals='{"cidr": "%s"}'
+							hx-confirm="Are you sure you want to remove %s?"
+							hx-target="closest div[data-cidr]"
+							hx-swap="outerHTML swap:500ms">Delete</button>
+					</div>
+				</div>
+			</div>`, req.CIDR, req.CIDR, req.Interval, req.Timeout,
+				func() string {
+					if req.Public {
+						return `<div class="badge badge-success badge-sm">Public</div>`
+					}
+					return `<div class="badge badge-ghost badge-sm">Private</div>`
+				}(), req.CIDR, req.CIDR)
+		} else {
+			s.respond(w, r, map[string]interface{}{"message": fmt.Sprintf("Added %d hosts from CIDR", count), "cidr": req.CIDR, "count": count})
+		}
+
 	case http.MethodDelete:
 		// Delete a range
-		// Expect 'cidr' in body or query
+		s.logger.Info("requests", "=== DELETE /api/ranges called ===")
+		s.logger.Info("requests", "DELETE ranges Content-Type: %s", r.Header.Get("Content-Type"))
+		s.logger.Info("requests", "DELETE ranges Content-Length: %d", r.ContentLength)
+
 		var cidr string
 		if r.Body != nil && r.ContentLength > 0 {
 			body, _ := io.ReadAll(r.Body)
-			cidr = strings.TrimSpace(string(body))
+			s.logger.Info("requests", "DELETE ranges body: %q", string(body))
+
+			// Try to parse as form data first (htmx sends this)
+			if strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+				values, err := url.ParseQuery(string(body))
+				if err == nil {
+					cidr = values.Get("cidr")
+					s.logger.Info("requests", "DELETE ranges from form data: %q", cidr)
+				}
+			} else if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+				// Try JSON parsing
+				var req struct {
+					CIDR string `json:"cidr"`
+				}
+				if json.Unmarshal(body, &req) == nil && req.CIDR != "" {
+					cidr = req.CIDR
+					s.logger.Info("requests", "DELETE ranges from JSON: %q", cidr)
+				}
+			}
+
+			// Fallback to plain text
+			if cidr == "" {
+				cidr = strings.TrimSpace(string(body))
+				if cidr != "" {
+					s.logger.Info("requests", "DELETE ranges from plain body: %q", cidr)
+				}
+			}
 		}
 		if cidr == "" {
 			cidr = r.URL.Query().Get("cidr")
+			s.logger.Info("requests", "DELETE ranges from query param: %q", cidr)
 		}
 
 		if cidr == "" {
+			s.logger.Warning("requests", "Delete range: CIDR parameter is missing or empty")
 			http.Error(w, "CIDR is required", http.StatusBadRequest)
 			return
+		}
+
+		s.logger.Info("requests", "Deleting network range: %s", cidr)
+
+		// Log current config state
+		s.logger.Info("requests", "Current config has %d ranges:", len(s.config.NetworkRanges))
+		for i, nr := range s.config.NetworkRanges {
+			s.logger.Info("requests", "  Range[%d]: %q", i, nr.CIDR)
 		}
 
 		// Find and remove from config
 		found := false
 		var newRanges []NetworkRangeConfig
 		for _, nr := range s.config.NetworkRanges {
+			s.logger.Info("requests", "Comparing config CIDR %q with target %q: match=%v", nr.CIDR, cidr, nr.CIDR == cidr)
 			if nr.CIDR == cidr {
 				found = true
+				s.logger.Info("requests", "Found matching range, skipping it")
 				continue
 			}
 			newRanges = append(newRanges, nr)
 		}
 
+		s.logger.Info("requests", "After search: found=%v, remaining ranges=%d", found, len(newRanges))
+
 		if !found {
+			s.logger.Warning("requests", "Range %q not found in config", cidr)
 			http.Error(w, "Range not found", http.StatusNotFound)
 			return
 		}
@@ -568,7 +858,12 @@ func (s *Server) handleRanges(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		s.respond(w, r, map[string]interface{}{"message": "Range removed", "cidr": cidr, "hosts_removed": removedCount})
+		// For htmx, return empty response
+		if s.isHtmxRequest(r) {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			s.respond(w, r, map[string]interface{}{"message": "Range removed", "cidr": cidr, "hosts_removed": removedCount})
+		}
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -596,18 +891,26 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req struct {
 			Host     string `json:"host"`
+			Port     string `json:"port"`
 			Interval string `json:"interval"`
 			Timeout  string `json:"timeout"`
 		}
 
-		// Handle both JSON and plain text body for backward compatibility or simple adds
+		// Handle both JSON and form data
 		contentType := r.Header.Get("Content-Type")
 		if strings.Contains(contentType, "application/json") {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+		} else if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+			r.ParseForm()
+			req.Host = r.FormValue("host")
+			req.Port = r.FormValue("port")
+			req.Interval = r.FormValue("interval")
+			req.Timeout = r.FormValue("timeout")
 		} else {
+			// Plain text body for backward compatibility
 			body, _ := io.ReadAll(r.Body)
 			req.Host = strings.TrimSpace(string(body))
 		}
@@ -615,6 +918,11 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 		if req.Host == "" {
 			http.Error(w, "Host is required", http.StatusBadRequest)
 			return
+		}
+
+		// Combine host and port if port is provided and host doesn't already have a port
+		if req.Port != "" && !strings.Contains(req.Host, ":") {
+			req.Host = req.Host + ":" + req.Port
 		}
 
 		interval, _ := time.ParseDuration(req.Interval)
@@ -685,7 +993,22 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 		} else {
 			host := normalizeTarget(req.Host)
 			s.monitor.AddHost(host, interval, timeout, false)
-			s.respond(w, r, map[string]string{"message": "Host added", "host": host})
+
+			// For htmx, return the new host row HTML
+			if s.isHtmxRequest(r) {
+				hostData := map[string]interface{}{
+					"Host":            host,
+					"Status":          "N/A",
+					"LastRun":         "00:00:00",
+					"Interval":        interval.String(),
+					"Timeout":         timeout.String(),
+					"Public":          false,
+					"IsAuthenticated": true,
+				}
+				s.renderPartial(w, "host-row", hostData)
+			} else {
+				s.respond(w, r, map[string]string{"message": "Host added", "host": host})
+			}
 		}
 
 	case http.MethodPut:
@@ -693,11 +1016,24 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 			Host     string `json:"host"`
 			Interval string `json:"interval"`
 			Timeout  string `json:"timeout"`
+			Public   bool   `json:"public"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+
+		// Handle both JSON and form data
+		contentType := r.Header.Get("Content-Type")
+		if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+			r.ParseForm()
+			req.Host = r.FormValue("host")
+			req.Interval = r.FormValue("interval")
+			req.Timeout = r.FormValue("timeout")
+			req.Public = r.FormValue("public") == "on"
+		} else {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
+
 		if req.Host == "" {
 			http.Error(w, "Host is required", http.StatusBadRequest)
 			return
@@ -717,27 +1053,123 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 		if h, ok := s.monitor.Hosts[host]; ok {
 			h.Interval = interval
 			h.Timeout = timeout
-			s.logger.Info("checks", "Updated host: %s (interval: %v, timeout: %v)", host, interval, timeout)
+			h.Public = req.Public
+			s.logger.Info("checks", "Updated host: %s (interval: %v, timeout: %v, public: %v)", host, interval, timeout, req.Public)
 			s.monitor.mu.Unlock()
-			s.respond(w, r, map[string]string{"message": "Host updated", "host": host})
+
+			// For htmx, return the updated host row
+			if s.isHtmxRequest(r) {
+				// Get latest status
+				s.monitor.mu.RLock()
+				results := make(map[string]CheckResult)
+				for i := len(s.monitor.History) - 1; i >= 0; i-- {
+					res := s.monitor.History[i]
+					if _, ok := results[res.Host]; !ok {
+						results[res.Host] = res
+					}
+				}
+				s.monitor.mu.RUnlock()
+
+				status := "N/A"
+				lastRun := "00:00:00"
+				if h.LastRun.Unix() > 0 {
+					lastRun = h.LastRun.Format("15:04:05")
+				}
+				if res, ok := results[host]; ok {
+					status = res.Status
+					lastRun = res.Time.Format("15:04:05")
+				}
+
+				// Find and return the updated row
+				hostData := map[string]interface{}{
+					"Host":            host,
+					"Status":          status,
+					"LastRun":         lastRun,
+					"Interval":        interval.String(),
+					"Timeout":         timeout.String(),
+					"Public":          req.Public,
+					"IsAuthenticated": true,
+				}
+				w.WriteHeader(http.StatusOK)
+				s.renderPartial(w, "host-row", hostData)
+			} else {
+				s.respond(w, r, map[string]string{"message": "Host updated", "host": host})
+			}
 		} else {
 			s.monitor.mu.Unlock()
 			http.Error(w, "Host not found", http.StatusNotFound)
 		}
 
 	case http.MethodDelete:
+		s.logger.Info("requests", "=== DELETE /api/hosts called ===")
 		body, _ := io.ReadAll(r.Body)
-		host := strings.TrimSpace(string(body))
+		s.logger.Info("requests", "DELETE hosts body: %q", string(body))
+		s.logger.Info("requests", "DELETE hosts Content-Type: %s", r.Header.Get("Content-Type"))
+
+		var host string
+
+		// Try to parse as form data first (htmx sends this)
+		if strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+			values, err := url.ParseQuery(string(body))
+			if err == nil {
+				host = values.Get("host")
+				s.logger.Info("requests", "DELETE hosts from form data: %q", host)
+			}
+		} else if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+			// Try JSON parsing
+			var req struct {
+				Host string `json:"host"`
+			}
+			if json.Unmarshal(body, &req) == nil && req.Host != "" {
+				host = req.Host
+				s.logger.Info("requests", "DELETE hosts from JSON: %q", host)
+			}
+		}
+
+		// Fallback to plain text body or query param
 		if host == "" {
-			host = r.URL.Query().Get("host")
+			host = strings.TrimSpace(string(body))
+			if host != "" {
+				s.logger.Info("requests", "DELETE hosts from plain body: %q", host)
+			}
 		}
 		if host == "" {
+			host = r.URL.Query().Get("host")
+			s.logger.Info("requests", "DELETE hosts from query param: %q", host)
+		}
+
+		if host == "" {
+			s.logger.Warning("requests", "DELETE hosts: no host provided")
 			http.Error(w, "Host is required", http.StatusBadRequest)
 			return
 		}
+
+		originalHost := host
 		host = normalizeTarget(host)
+		s.logger.Info("requests", "DELETE hosts: normalized %q to %q", originalHost, host)
+
+		// Check if host exists before removal
+		s.monitor.mu.RLock()
+		found := false
+		for _, h := range s.monitor.Hosts {
+			if h.Host == host {
+				found = true
+				break
+			}
+		}
+		s.monitor.mu.RUnlock()
+
+		s.logger.Info("requests", "DELETE hosts: host %q found=%v", host, found)
+
 		s.monitor.RemoveHost(host)
-		s.respond(w, r, map[string]string{"message": "Host removed", "host": host})
+		s.logger.Info("requests", "DELETE hosts: RemoveHost called for %q", host)
+
+		// For htmx, return empty response (row will be swapped out)
+		if s.isHtmxRequest(r) {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			s.respond(w, r, map[string]string{"message": "Host removed", "host": host})
+		}
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -850,117 +1282,256 @@ func (s *Server) isWhitelisted(remoteAddr string) bool {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	_, isAuthenticated := s.auth.GetAuthFromRequest(r)
+	apiKey, isAuthenticated := s.auth.GetAuthFromRequest(r)
 
 	if !isAuthenticated {
 		isAuthenticated = s.isWhitelisted(r.RemoteAddr)
 	}
 
 	s.monitor.mu.RLock()
-	var hosts []*HostStatus
-	for _, h := range s.monitor.Hosts {
-		if isAuthenticated || h.Public {
-			hosts = append(hosts, h)
-		}
-	}
+	var hosts []map[string]interface{}
+	totalOnline := 0
+	totalOffline := 0
 
 	// Also get latest results for these hosts
 	results := make(map[string]CheckResult)
 	for i := len(s.monitor.History) - 1; i >= 0; i-- {
 		res := s.monitor.History[i]
 		if _, ok := results[res.Host]; !ok {
-			if h, ok2 := s.monitor.Hosts[res.Host]; ok2 && (isAuthenticated || h.Public) {
-				results[res.Host] = res
-			}
+			results[res.Host] = res
+		}
+	}
+
+	var hostList []*HostStatus
+	for _, h := range s.monitor.Hosts {
+		if isAuthenticated || h.Public {
+			hostList = append(hostList, h)
 		}
 	}
 	s.monitor.mu.RUnlock()
 
-	sort.Slice(hosts, func(i, j int) bool {
-		return hosts[i].Host < hosts[j].Host
+	sort.Slice(hostList, func(i, j int) bool {
+		return hostList[i].Host < hostList[j].Host
 	})
 
-	// Simple HTML response
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, "<html><head><title>SSH Monitor</title><style>table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:8px;} .SSH{color:green;} .TIMEOUT{color:red;} .ACTIVE_REJECT{color:orange;} .PROTOCOL_MISMATCH{color:purple;}</style></head><body>")
-	fmt.Fprintf(w, "<h1>SSH Monitor Status</h1>")
-	if isAuthenticated {
-		fmt.Fprintf(w, "<p>Authenticated access. <a href='/form/'>Manage Hosts/Keys</a></p>")
-	} else {
-		fmt.Fprintf(w, "<p>Public access (showing public hosts only). <a href='/form/'>Login</a></p>")
-	}
-	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Last Run</th><th>Status</th></tr>")
-	for _, h := range hosts {
+	for _, h := range hostList {
 		status := "N/A"
-		class := ""
+		lastRun := "00:00:00"
+		if h.LastRun.Unix() > 0 {
+			lastRun = h.LastRun.Format("15:04:05")
+		}
 		if res, ok := results[h.Host]; ok {
 			status = res.Status
-			class = res.Status
+			lastRun = res.Time.Format("15:04:05")
+			if status == "SSH" {
+				totalOnline++
+			} else if status == "TIMEOUT" {
+				totalOffline++
+			}
 		}
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%v</td><td>%v</td><td>%s</td><td class='%s'>%s</td></tr>",
-			h.Host, h.Interval, h.Timeout, h.LastRun.Format("15:04:05"), class, status)
+
+		hosts = append(hosts, map[string]interface{}{
+			"Host":            h.Host,
+			"Status":          status,
+			"LastRun":         lastRun,
+			"Interval":        h.Interval.String(),
+			"Timeout":         h.Timeout.String(),
+			"Public":          h.Public,
+			"IsAuthenticated": isAuthenticated,
+		})
 	}
-	fmt.Fprintf(w, "</table></body></html>")
+
+	data := map[string]interface{}{
+		"Title":           "Dashboard",
+		"Page":            "index",
+		"IsAuthenticated": isAuthenticated,
+		"KeyType":         apiKey.Type,
+		"Hosts":           hosts,
+		"Stats": map[string]int{
+			"Total":   len(hosts),
+			"Online":  totalOnline,
+			"Offline": totalOffline,
+		},
+	}
+
+	s.templates.Render(w, "index", data)
 }
 
 func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
+	apiKey, _ := s.auth.GetAuthFromRequest(r)
+
 	s.monitor.mu.RLock()
-	var hosts []*HostStatus
+
+	// Get latest results for each host
+	results := make(map[string]CheckResult)
+	for i := len(s.monitor.History) - 1; i >= 0; i-- {
+		res := s.monitor.History[i]
+		if _, ok := results[res.Host]; !ok {
+			results[res.Host] = res
+		}
+	}
+
+	var hosts []map[string]interface{}
 	for _, h := range s.monitor.Hosts {
-		hosts = append(hosts, h)
+		status := "N/A"
+		lastRun := "00:00:00"
+		if h.LastRun.Unix() > 0 {
+			lastRun = h.LastRun.Format("15:04:05")
+		}
+		if res, ok := results[h.Host]; ok {
+			status = res.Status
+			lastRun = res.Time.Format("15:04:05")
+		}
+
+		hosts = append(hosts, map[string]interface{}{
+			"Host":            h.Host,
+			"Status":          status,
+			"LastRun":         lastRun,
+			"Interval":        h.Interval.String(),
+			"Timeout":         h.Timeout.String(),
+			"Public":          h.Public,
+			"IsAuthenticated": true,
+		})
+	}
+
+	// Get network ranges
+	var networkRanges []map[string]interface{}
+	for _, nr := range s.config.NetworkRanges {
+		interval := s.config.DefaultInterval
+		if nr.Interval != "" {
+			interval = nr.Interval
+		}
+		timeout := s.config.DefaultTimeout
+		if nr.Timeout != "" {
+			timeout = nr.Timeout
+		}
+		networkRanges = append(networkRanges, map[string]interface{}{
+			"CIDR":     nr.CIDR,
+			"Interval": interval,
+			"Timeout":  timeout,
+			"Public":   nr.Public,
+		})
 	}
 	s.monitor.mu.RUnlock()
 
 	sort.Slice(hosts, func(i, j int) bool {
-		return hosts[i].Host < hosts[j].Host
+		return hosts[i]["Host"].(string) < hosts[j]["Host"].(string)
 	})
 
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, "<html><head><title>Management</title><style>table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:8px;}</style></head><body>")
-	fmt.Fprintf(w, "<h1>Management Interface</h1>")
-	fmt.Fprintf(w, "<p><a href='/'>Back to Status</a> | <a href='/logout'>Logout</a></p>")
-
-	fmt.Fprintf(w, "<h2>Hosts</h2>")
-	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Type</th><th>Actions</th></tr>")
-	for _, h := range hosts {
-		hType := "Private"
-		if h.Public {
-			hType = "Public"
-		}
-		fmt.Fprintf(w, "<tr>")
-		fmt.Fprintf(w, "<td>%s</td>", h.Host)
-		fmt.Fprintf(w, "<td><input type='text' id='int-%s' value='%v' size='5'></td>", h.Host, h.Interval)
-		fmt.Fprintf(w, "<td><input type='text' id='tout-%s' value='%v' size='5'></td>", h.Host, h.Timeout)
-		fmt.Fprintf(w, "<td>%s</td>", hType)
-		fmt.Fprintf(w, "<td>")
-		fmt.Fprintf(w, "<button onclick=\"updateHost('%s')\">Update</button> ", h.Host)
-		fmt.Fprintf(w, "<button onclick=\"deleteHost('%s')\">Delete</button>", h.Host)
-		fmt.Fprintf(w, "</td>")
-		fmt.Fprintf(w, "</tr>")
+	data := map[string]interface{}{
+		"Title":           "Admin",
+		"Page":            "admin",
+		"IsAuthenticated": true,
+		"KeyType":         apiKey.Type,
+		"Hosts":           hosts,
+		"NetworkRanges":   networkRanges,
+		"MasterKeys":      s.config.MasterKeys,
+		"NormalKeys":      s.config.NormalKeys,
 	}
-	fmt.Fprintf(w, "</table>")
 
-	fmt.Fprintf(w, "<h2>Add Host</h2>")
-	fmt.Fprintf(w, "<form onsubmit='return addHost(this)'>")
-	fmt.Fprintf(w, "Host: <input type='text' name='host' required> ")
-	fmt.Fprintf(w, "Interval: <input type='text' name='interval' placeholder='10m'> ")
-	fmt.Fprintf(w, "Timeout: <input type='text' name='timeout' placeholder='5s'> ")
-	fmt.Fprintf(w, "<input type='submit' value='Add'>")
-	fmt.Fprintf(w, "</form>")
+	// For htmx requests to partial updates, render just the requested part
+	if s.isHtmxRequest(r) {
+		target := r.Header.Get("HX-Target")
+		if target != "" && target != "body" {
+			// Handle partial renders if needed
+			s.templates.Render(w, "admin", data)
+			return
+		}
+	}
 
-	fmt.Fprintf(w, "<h2>API Keys</h2>")
-	fmt.Fprintf(w, "<button onclick='generateKey()'>Generate New Normal Key</button>")
-	fmt.Fprintf(w, "<div id='new-key' style='margin-top:10px; font-weight:bold; color:blue;'></div>")
+	s.templates.Render(w, "admin", data)
+}
 
-	fmt.Fprintf(w, "<script>")
-	fmt.Fprintf(w, "function copyToClipboard(text) { navigator.clipboard.writeText(text).then(() => { alert('Key copied to clipboard'); }).catch(err => { console.error('Failed to copy: ', err); }); }")
-	fmt.Fprintf(w, "function addHost(f){ fetch('/api/hosts', {method:'POST', headers:{'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify({host:f.host.value, interval:f.interval.value, timeout:f.timeout.value})}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); return false; }")
-	fmt.Fprintf(w, "function updateHost(host){ var interval=document.getElementById('int-'+host).value; var timeout=document.getElementById('tout-'+host).value; fetch('/api/hosts', {method:'PUT', headers:{'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify({host:host, interval:interval, timeout:timeout})}).then(r=>r.json()).then(d=>alert(d.message)).catch(e=>alert(e)); }")
-	fmt.Fprintf(w, "function deleteHost(host){ if(confirm('Delete '+host+'?')){ fetch('/api/hosts', {method:'DELETE', headers:{'Accept':'application/json'}, body:host}).then(r=>r.json()).then(d=>{alert(d.message); location.reload();}).catch(e=>alert(e)); } }")
-	fmt.Fprintf(w, "function generateKey(){ fetch('/api/keys', {method:'POST', headers:{'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify({generate:true, type:'normal'})}).then(r=>r.json()).then(d=>{ document.getElementById('new-key').innerHTML = 'New Key: <code id=\"key-val\">' + d.key + '</code> <button onclick=\"copyToClipboard(\\''+d.key+'\\')\">Copy</button>'; alert('Key generated and saved to config.json'); }).catch(e=>alert(e)); }")
-	fmt.Fprintf(w, "</script>")
+// Debug endpoints for diagnostics
+func (s *Server) handleDebugHosts(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("debug", "=== DEBUG: /api/debug/hosts called ===")
 
-	fmt.Fprintf(w, "</body></html>")
+	s.monitor.mu.RLock()
+	defer s.monitor.mu.RUnlock()
+
+	type HostDebug struct {
+		Host     string `json:"host"`
+		Interval string `json:"interval"`
+		Timeout  string `json:"timeout"`
+		Public   bool   `json:"public"`
+		LastRun  string `json:"last_run"`
+	}
+
+	hosts := make([]HostDebug, 0, len(s.monitor.Hosts))
+	for _, h := range s.monitor.Hosts {
+		lastRun := "never"
+		if !h.LastRun.IsZero() {
+			lastRun = h.LastRun.Format(time.RFC3339)
+		}
+		hosts = append(hosts, HostDebug{
+			Host:     h.Host,
+			Interval: h.Interval.String(),
+			Timeout:  h.Timeout.String(),
+			Public:   h.Public,
+			LastRun:  lastRun,
+		})
+	}
+
+	s.logger.Info("debug", "Total hosts in monitor: %d", len(hosts))
+	for i, h := range hosts {
+		s.logger.Info("debug", "  Host[%d]: %s (public=%v, interval=%s, timeout=%s)", i, h.Host, h.Public, h.Interval, h.Timeout)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total": len(hosts),
+		"hosts": hosts,
+	})
+}
+
+func (s *Server) handleDebugRanges(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("debug", "=== DEBUG: /api/debug/ranges called ===")
+
+	type RangeDebug struct {
+		CIDR     string `json:"cidr"`
+		Interval string `json:"interval"`
+		Timeout  string `json:"timeout"`
+		Public   bool   `json:"public"`
+	}
+
+	ranges := make([]RangeDebug, 0, len(s.config.NetworkRanges))
+	for _, nr := range s.config.NetworkRanges {
+		ranges = append(ranges, RangeDebug{
+			CIDR:     nr.CIDR,
+			Interval: nr.Interval,
+			Timeout:  nr.Timeout,
+			Public:   nr.Public,
+		})
+	}
+
+	s.logger.Info("debug", "Total ranges in config: %d", len(ranges))
+	for i, r := range ranges {
+		s.logger.Info("debug", "  Range[%d]: %s (public=%v, interval=%s, timeout=%s)", i, r.CIDR, r.Public, r.Interval, r.Timeout)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total":  len(ranges),
+		"ranges": ranges,
+	})
+}
+
+func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("debug", "=== DEBUG: /api/debug/config called ===")
+
+	configData := map[string]interface{}{
+		"network_ranges_count": len(s.config.NetworkRanges),
+		"network_ranges":       s.config.NetworkRanges,
+		"master_keys_count":    len(s.config.MasterKeys),
+		"normal_keys_count":    len(s.config.NormalKeys),
+	}
+
+	s.logger.Info("debug", "Config has %d network ranges", len(s.config.NetworkRanges))
+	s.logger.Info("debug", "Config has %d master keys", len(s.config.MasterKeys))
+	s.logger.Info("debug", "Config has %d normal keys", len(s.config.NormalKeys))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(configData)
 }
 
 func (s *Server) respond(w http.ResponseWriter, r *http.Request, data interface{}) {
@@ -984,6 +1555,26 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, data interface{
 	// Default: Plain text
 	w.Header().Set("Content-Type", "text/plain")
 	s.writePlainText(w, data)
+}
+
+// isHtmxRequest checks if the request is from htmx
+func (s *Server) isHtmxRequest(r *http.Request) bool {
+	return r.Header.Get("HX-Request") == "true"
+}
+
+// renderPartial renders a partial template for htmx responses
+func (s *Server) renderPartial(w http.ResponseWriter, templateName string, data interface{}) {
+	s.templates.Render(w, templateName, data)
+}
+
+// respondWithPartial sends either a partial HTML (for htmx) or JSON (for API calls)
+func (s *Server) respondWithPartial(w http.ResponseWriter, r *http.Request, templateName string, jsonData interface{}, templateData interface{}) {
+	if s.isHtmxRequest(r) {
+		s.renderPartial(w, templateName, templateData)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(jsonData)
+	}
 }
 
 func (s *Server) writeYAML(w io.Writer, data interface{}) {
@@ -1019,6 +1610,49 @@ func (s *Server) writePlainText(w io.Writer, data interface{}) {
 	default:
 		fmt.Fprintf(w, "%v\n", v)
 	}
+}
+
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Check authentication
+	apiKey, isAuthenticated := s.auth.GetAuthFromRequest(r)
+
+	// Allow unauthenticated connections (they'll only see public hosts)
+	if !isAuthenticated {
+		isAuthenticated = s.isWhitelisted(r.RemoteAddr)
+	}
+
+	// Upgrade HTTP connection to WebSocket
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			// Allow all origins for now (consider restricting in production)
+			return true
+		},
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.logger.Error("websocket", "Failed to upgrade connection: %v", err)
+		return
+	}
+
+	// Create new client
+	client := &Client{
+		hub:             s.hub,
+		conn:            conn,
+		send:            make(chan []byte, 256),
+		isAuthenticated: isAuthenticated,
+		lastPong:        time.Now(),
+	}
+
+	// Register client with hub
+	s.hub.register <- client
+
+	// Start client goroutines
+	client.ServeWS()
+
+	s.logger.Info("websocket", "Client connected (authenticated: %v, type: %s)", isAuthenticated, apiKey.Type)
 }
 
 func normalizeTarget(target string) string {
@@ -1160,4 +1794,56 @@ func inc(ip net.IP) {
 			break
 		}
 	}
+}
+
+// handleDebugTestWebSocket tests WebSocket by adding a test host and broadcasting an update
+func (s *Server) handleDebugTestWebSocket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Add a test host
+	testHost := fmt.Sprintf("test-%d.example.com:22", time.Now().Unix())
+	s.monitor.AddHost(testHost, 5*time.Minute, 3*time.Second, true)
+	s.logger.Info("debug", "Added test host: %s", testHost)
+
+	// Manually trigger a status update broadcast
+	result := CheckResult{
+		Host:   testHost,
+		Status: "SSH",
+		Time:   time.Now(),
+	}
+
+	if s.hub != nil {
+		s.hub.BroadcastHostUpdate(result)
+		s.logger.Info("debug", "Broadcasted status update for %s", testHost)
+	} else {
+		s.logger.Warning("debug", "Hub is nil, cannot broadcast")
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"host":    testHost,
+		"message": "Test host added and WebSocket update broadcasted",
+	})
+}
+
+// handleDebugWebSocketStatus shows WebSocket connection status
+func (s *Server) handleDebugWebSocketStatus(w http.ResponseWriter, r *http.Request) {
+	if s.hub == nil {
+		http.Error(w, "WebSocket hub not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	s.hub.mu.RLock()
+	clientCount := len(s.hub.clients)
+	s.hub.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"connected_clients": clientCount,
+		"hub_running":       s.hub != nil,
+	})
 }
