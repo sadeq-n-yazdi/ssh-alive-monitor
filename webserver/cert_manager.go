@@ -53,14 +53,14 @@ func (cm *CertManager) loadCert() error {
 
 func (cm *CertManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	// Check for updates periodically or on every request (throttled)
-	// For simplicity, we'll check stat every time but it's fast. 
+	// For simplicity, we'll check stat every time but it's fast.
 	// To avoid too many stat calls, we could throttle.
 	// But let's keep it simple: just return cached cert, and have a background routine update it.
-	
+
 	cm.mu.RLock()
 	cert := cm.cert
 	cm.mu.RUnlock()
-	
+
 	return cert, nil
 }
 

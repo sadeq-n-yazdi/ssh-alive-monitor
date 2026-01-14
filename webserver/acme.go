@@ -40,10 +40,10 @@ func (u *ACMEUser) GetPrivateKey() crypto.PrivateKey {
 }
 
 type ACMEManager struct {
-	config      *Config
-	logger      *Logger
-	httpTokens  map[string]string
-	httpMu      sync.RWMutex
+	config     *Config
+	logger     *Logger
+	httpTokens map[string]string
+	httpMu     sync.RWMutex
 }
 
 func NewACMEManager(cfg *Config, logger *Logger) *ACMEManager {
@@ -103,8 +103,8 @@ func (p *ManualDNSProvider) Present(domain, token, keyAuth string) error {
 	p.logger.Info("requests", "  Type:   TXT")
 	p.logger.Info("requests", "  Value:  %s", value)
 	p.logger.Info("requests", "Waiting 60 seconds for propagation...")
-	
-	// In a real interactive app we'd wait for user input. 
+
+	// In a real interactive app we'd wait for user input.
 	// For a service, we have to just wait and hope the user sees the log and updates it fast enough.
 	// Or we can poll? No, we don't know the DNS provider.
 	time.Sleep(60 * time.Second)
@@ -153,7 +153,7 @@ func (am *ACMEManager) ObtainCert() error {
 	} else {
 		config.CADirURL = lego.LEDirectoryProduction
 	}
-	
+
 	config.Certificate.KeyType = certcrypto.RSA2048
 
 	client, err := lego.NewClient(config)
@@ -187,7 +187,7 @@ func (am *ACMEManager) ObtainCert() error {
 			// No, standard is: value = SHA256(keyAuth).
 			// Lego's dns01 has helpers.
 			// We need to import "github.com/go-acme/lego/v4/challenge/dns01"
-			// But for now, let's skip manual implementation complexity of calculating hash 
+			// But for now, let's skip manual implementation complexity of calculating hash
 			// if I can't easily import `dns01`.
 			// Actually `client.Challenge.SetDNS01Provider` expects `challenge.Provider`.
 			// `Present` receives `keyAuth`. The TXT value IS the keyAuth? No.
@@ -271,27 +271,27 @@ func (am *ACMEManager) checkAndRenew() {
 	// Simple check: Issuer == Subject
 	isSelfSigned := cert.Issuer.String() == cert.Subject.String()
 	if isSelfSigned {
-		// Try to replace self-signed cert every 24h. 
+		// Try to replace self-signed cert every 24h.
 		// Since this loop runs hourly, we should track last attempt or just try.
 		// If we fail, we sleep 12h (handled by attemptRenew logic? No, simplistic here).
 		// The requirement: "if the certificate in use is a self-certificate try to make the certificate once every day in every 24 hour."
 		// We can just check if we haven't tried recently.
 		// For simplicity, let's try. If it fails, the error is logged.
 		// But we don't want to spam ACME servers if config is wrong.
-		// We'll rely on attemptRenew's backoff if we implemented it, 
+		// We'll rely on attemptRenew's backoff if we implemented it,
 		// but here we'll just check if enough time passed since last file mod?
 		// No, file mod is when it was CREATED.
 		// If it's self-signed, we want to replace it with a valid one.
 		// We should try.
-		
-		// To avoid spamming on persistent failure (e.g. 1h loop), 
-		// we can check if we tried recently. 
+
+		// To avoid spamming on persistent failure (e.g. 1h loop),
+		// we can check if we tried recently.
 		// Let's use a simple memory flag or time.
-		// For now, let's try every time the loop runs (1h) if it's self-signed? 
+		// For now, let's try every time the loop runs (1h) if it's self-signed?
 		// The requirement says "once every day".
 		// We can check `cert.NotBefore`. If it was generated < 24h ago AND is self-signed, maybe wait?
 		// But if we just started, we want to try immediately.
-		
+
 		// Let's try. If fail, we sleep 12h.
 		am.attemptRenew("Self-signed certificate detected")
 		return
@@ -326,7 +326,7 @@ func (am *ACMEManager) attemptRenew(reason string) {
 		am.logger.Info("requests", "Certificate renewal successful.")
 		// Reset timer so we don't block next valid check (though next check won't trigger if cert is good)
 		renewalMu.Lock()
-		lastRenewalAttempt = time.Time{} 
+		lastRenewalAttempt = time.Time{}
 		renewalMu.Unlock()
 	}
 }
