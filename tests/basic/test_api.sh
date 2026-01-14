@@ -1,20 +1,28 @@
 #!/bin/bash
 
+# Get absolute path to project root
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+WEBSERVER_DIR="$ROOT_DIR/webserver"
+
+# Ensure we are in the root directory for consistency
+cd "$ROOT_DIR"
+
 # Port to run the server on
 PORT=8082
 API_URL="http://localhost:$PORT"
 API_KEY="master-key-123"
 
 # Check if config.json exists and try to extract a master key
-if [ -f "webserver/config.json" ]; then
-    FOUND_KEY=$(grep -oP '"master_keys":\s*\[\s*"\K[^"]+' webserver/config.json | head -n 1)
+if [ -f "$WEBSERVER_DIR/config.json" ]; then
+    FOUND_KEY=$(sed -n 's/.*"master_keys": *\[ *"\([^"]*\)".*/\1/p' "$WEBSERVER_DIR/config.json" | head -n 1)
     if [ ! -z "$FOUND_KEY" ]; then
         API_KEY="$FOUND_KEY"
     fi
 fi
 
 echo "Building webserver..."
-cd webserver
+cd "$WEBSERVER_DIR"
 go build -o ssh-monitor
 if [ $? -ne 0 ]; then
     echo "Build failed!"
@@ -26,6 +34,13 @@ echo "Starting webserver on port $PORT..."
 SERVER_PID=$!
 # Give it a second to start
 sleep 2
+
+function cleanup {
+    echo "Killing server..."
+    kill $SERVER_PID
+    rm -f ssh-monitor
+}
+trap cleanup EXIT
 
 echo "---------------------------------------------------"
 echo "Test 1: Add Hosts"

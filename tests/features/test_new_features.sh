@@ -2,13 +2,21 @@
 
 # Comprehensive test script for SSH Alive Monitor
 
+# Get absolute path to project root
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+WEBSERVER_DIR="$ROOT_DIR/webserver"
+
+# Ensure we are in the root directory for consistency
+cd "$ROOT_DIR"
+
 PORT=8083
 API_URL="http://localhost:$PORT"
 MASTER_KEY="master-key-123"
 NORMAL_KEY="normal-key-456"
 
 echo "Building webserver..."
-cd webserver
+cd "$WEBSERVER_DIR"
 go build -o ssh-monitor .
 if [ $? -ne 0 ]; then
     echo "Build failed!"
@@ -23,6 +31,7 @@ sleep 2
 function cleanup {
     echo "Killing server..."
     kill $SERVER_PID
+    rm -f ssh-monitor
 }
 trap cleanup EXIT
 

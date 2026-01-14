@@ -56,7 +56,7 @@ func main() {
 	}
 
 	auth := NewAuthManager(cfg)
-	monitor := NewMonitor(logger)
+	monitor := NewMonitor(logger, cfg.CheckPoolSize, cfg.MaxSubnetConcurrency, cfg.HistoryLimit)
 
 	// Add predefined hosts from simple list
 	defaultInterval, _ := time.ParseDuration(cfg.DefaultInterval)
@@ -80,6 +80,31 @@ func main() {
 			}
 		}
 		monitor.AddHost(normalizeTarget(hc.Host), interval, timeout, hc.Public)
+	}
+
+	// Add hosts from configured network ranges
+	for _, nr := range cfg.NetworkRanges {
+		interval := defaultInterval
+		if nr.Interval != "" {
+			if d, err := time.ParseDuration(nr.Interval); err == nil {
+				interval = d
+			}
+		}
+		timeout := defaultTimeout
+		if nr.Timeout != "" {
+			if d, err := time.ParseDuration(nr.Timeout); err == nil {
+				timeout = d
+			}
+		}
+
+		ips, err := expandCIDR(nr.CIDR)
+		if err == nil {
+			for _, ip := range ips {
+				monitor.AddHost(normalizeTarget(ip), interval, timeout, nr.Public)
+			}
+		} else {
+			logger.Error("config", "Failed to expand network range %s: %v", nr.CIDR, err)
+		}
 	}
 
 	monitor.Start()
@@ -114,6 +139,7 @@ func main() {
 
 	// Hosts Management (Master can do everything, Normal can add/remove/change)
 	mux.HandleFunc("/api/hosts", s.auth.AuthMiddleware(s.handleHosts, KeyNormal))
+	mux.HandleFunc("/api/ranges", s.auth.AuthMiddleware(s.handleRanges, KeyNormal))
 
 	// Results (Normal and Master)
 	mux.HandleFunc("/api/results", s.handleResults)
@@ -342,6 +368,31 @@ func (s *Server) applyConfig(cfg *Config) {
 		s.monitor.AddHost(normalizeTarget(hc.Host), interval, timeout, hc.Public)
 	}
 
+	// Add hosts from configured network ranges
+	for _, nr := range cfg.NetworkRanges {
+		interval := defaultInterval
+		if nr.Interval != "" {
+			if d, err := time.ParseDuration(nr.Interval); err == nil {
+				interval = d
+			}
+		}
+		timeout := defaultTimeout
+		if nr.Timeout != "" {
+			if d, err := time.ParseDuration(nr.Timeout); err == nil {
+				timeout = d
+			}
+		}
+
+		ips, err := expandCIDR(nr.CIDR)
+		if err == nil {
+			for _, ip := range ips {
+				s.monitor.AddHost(normalizeTarget(ip), interval, timeout, nr.Public)
+			}
+		} else {
+			s.logger.Error("config", "Failed to expand network range %s: %v", nr.CIDR, err)
+		}
+	}
+
 	s.logger.Info("requests", "Configuration reloaded successfully")
 }
 
@@ -464,6 +515,66 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleRanges(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("requests", "Range management: %s %s", r.Method, r.URL.Path)
+	switch r.Method {
+	case http.MethodGet:
+		s.respond(w, r, s.config.NetworkRanges)
+
+	case http.MethodDelete:
+		// Delete a range
+		// Expect 'cidr' in body or query
+		var cidr string
+		if r.Body != nil && r.ContentLength > 0 {
+			body, _ := io.ReadAll(r.Body)
+			cidr = strings.TrimSpace(string(body))
+		}
+		if cidr == "" {
+			cidr = r.URL.Query().Get("cidr")
+		}
+
+		if cidr == "" {
+			http.Error(w, "CIDR is required", http.StatusBadRequest)
+			return
+		}
+
+		// Find and remove from config
+		found := false
+		var newRanges []NetworkRangeConfig
+		for _, nr := range s.config.NetworkRanges {
+			if nr.CIDR == cidr {
+				found = true
+				continue
+			}
+			newRanges = append(newRanges, nr)
+		}
+
+		if !found {
+			http.Error(w, "Range not found", http.StatusNotFound)
+			return
+		}
+
+		s.config.NetworkRanges = newRanges
+		s.saveConfig()
+
+		// Remove IPs from monitor
+		ips, err := expandCIDR(cidr)
+		removedCount := 0
+		if err == nil {
+			for _, ip := range ips {
+				host := normalizeTarget(ip)
+				s.monitor.RemoveHost(host)
+				removedCount++
+			}
+		}
+
+		s.respond(w, r, map[string]interface{}{"message": "Range removed", "cidr": cidr, "hosts_removed": removedCount})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	// For GET /api/hosts, we only show all hosts if authenticated.
 	// However, AuthMiddleware is already applied to /api/hosts for KeyNormal.
@@ -515,9 +626,67 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 			timeout, _ = time.ParseDuration(s.config.DefaultTimeout)
 		}
 
-		host := normalizeTarget(req.Host)
-		s.monitor.AddHost(host, interval, timeout, false)
-		s.respond(w, r, map[string]string{"message": "Host added", "host": host})
+		// Check for CIDR
+		if strings.Contains(req.Host, "/") {
+			_, ipNet, err := net.ParseCIDR(req.Host)
+			if err != nil {
+				// Not a valid CIDR, maybe just a host with some slash? (unlikely for hostname)
+				// Or invalid format.
+				http.Error(w, "Invalid CIDR format: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			// Check permissions for CIDR size
+			ones, bits := ipNet.Mask.Size()
+
+			// Enforce a maximum size for all users to prevent DoS (max /16 or 65536 hosts)
+			if bits-ones > 16 {
+				http.Error(w, "CIDR range is too large. Maximum allowed range size is /16.", http.StatusBadRequest)
+				return
+			}
+
+			apiKey, _ := s.auth.GetAuthFromRequest(r)
+			if apiKey.Type == KeyNormal {
+				// For IPv4, /24 is 24 ones. Limit is range smaller than /24.
+				// "smaller than /24" -> means fewer addresses? OR "range smaller than /24" usually means /25, /26...
+				// Wait, "limited to range smaller than /24"
+				// A /23 is LARGER range (512 IPs). A /25 is SMALLER range (128 IPs).
+				// So "range smaller than /24" means prefix >= 24.
+				if ones < 24 {
+					http.Error(w, "Normal users are limited to CIDR ranges /24 or smaller (e.g., /24, /25)", http.StatusForbidden)
+					return
+				}
+			}
+
+			ips, err := expandCIDR(req.Host)
+			if err != nil {
+				http.Error(w, "Failed to expand CIDR: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			count := 0
+			for _, ip := range ips {
+				host := normalizeTarget(ip)
+				s.monitor.AddHost(host, interval, timeout, false)
+				count++
+			}
+
+			// Persistence for Network Ranges
+			s.config.NetworkRanges = append(s.config.NetworkRanges, NetworkRangeConfig{
+				CIDR:     req.Host,
+				Interval: req.Interval,
+				Timeout:  req.Timeout,
+				Public:   false,
+			})
+			s.saveConfig()
+
+			s.respond(w, r, map[string]interface{}{"message": fmt.Sprintf("Added %d hosts from CIDR", count), "cidr": req.Host, "count": count})
+
+		} else {
+			host := normalizeTarget(req.Host)
+			s.monitor.AddHost(host, interval, timeout, false)
+			s.respond(w, r, map[string]string{"message": "Host added", "host": host})
+		}
 
 	case http.MethodPut:
 		var req struct {
@@ -956,4 +1125,39 @@ func generateSelfSignedCert(certPath, keyPath string, domains []string) error {
 	}
 
 	return nil
+}
+
+func expandCIDR(cidr string) ([]string, error) {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []string
+	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); {
+		ips = append(ips, ip.String())
+		inc(ip)
+
+		// Check for wrap-around to avoid infinite loop on /0
+		isZero := true
+		for _, b := range ip {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+		if isZero {
+			break
+		}
+	}
+	return ips, nil
+}
+
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
 }

@@ -39,7 +39,7 @@ Statuses:
 
 ## Web Server
 
-The web server provides a REST API to manage hosts and view monitoring results.
+The web server provides a REST API to manage hosts and view monitoring results. It features a concurrent worker pool for efficient checking and supports managing hosts via individual IPs or CIDR ranges.
 
 ### Installation
 
@@ -65,13 +65,16 @@ sudo ./install.sh
    ./ssh-monitor -port 8080
    ```
 
-### Authentication
+### Authentication & Sessions
 
-All API requests require an API key passed in the `X-API-Key` header or via **HTTP Basic Authentication** (use an empty username and the API key as the password).
+All API requests require an API key passed in the `X-API-Key` header or via **HTTP Basic Authentication**.
+
+- **Session Management**: Successful Basic Authentication sets a secure, HTTP-only cookie, allowing seamless access to the web interface without re-entering credentials.
+- **Logout**: You can log out by visiting `/logout`, which clears the session cookie.
 
 #### API Key Types
-- **Master Key**: Has full access, including managing other API keys.
-- **Normal Key**: Can manage hosts and view results, but cannot manage other keys.
+- **Master Key**: Has full access, including managing other API keys and adding large CIDR ranges.
+- **Normal Key**: Can manage hosts (restricted to /24 or smaller ranges) and view results, but cannot manage other keys.
 
 #### Key Generation
 Use the provided script to generate a secure API key:
@@ -91,6 +94,8 @@ The server reads configuration from `config.json` and `override.json`.
 | `log_format` | `text`, `json`, `color` | `color` |
 | `default_interval` | Interval between checks (e.g., `10m`, `1h`) | `10m` |
 | `default_timeout` | Timeout for each SSH check (e.g., `5s`) | `5s` |
+| `check_pool_size` | Max total concurrent checks | `100` |
+| `max_subnet_concurrency` | Max concurrent checks per /24 subnet | `2` |
 | `master_keys` | List of initial master API keys | `["master-key-123"]` |
 | `predefined_hosts`| Simple list of hosts visible without an API key | `[]` |
 | `hosts` | Detailed list of hosts with custom settings | `[]` |
@@ -133,8 +138,12 @@ The server provides a simple web interface for monitoring and management:
 - **Add Host (Plain Text)**
   ```bash
   curl -X POST -H "X-API-Key: YOUR_KEY" -d "192.168.1.10:22" http://localhost:8080/api/hosts
-  # OR using Basic Auth
-  curl -u ":YOUR_KEY" -X POST -d "192.168.1.10:22" http://localhost:8080/api/hosts
+  ```
+
+- **Add Host Range (CIDR)**
+  ```bash
+  # Adds all IPs in the range. Normal users limited to /24 or smaller.
+  curl -X POST -H "X-API-Key: YOUR_KEY" -d "192.168.1.0/24" http://localhost:8080/api/hosts
   ```
 
 - **Add Host (JSON with custom settings)**
@@ -188,17 +197,19 @@ The server provides a simple web interface for monitoring and management:
        http://localhost:8080/api/keys
   ```
 
-- **Disable/Enable Key**
-  ```bash
-  curl -X PATCH -H "X-API-Key: MASTER_KEY" -H "Content-Type: application/json" \
-       -d '{"key": "some-key", "enabled": false}' \
-       http://localhost:8080/api/keys
-  ```
+## Testing
 
-- **Delete Key**
-  ```bash
-  curl -X DELETE -H "X-API-Key: MASTER_KEY" "http://localhost:8080/api/keys?key=some-key"
-  ```
+The project includes a comprehensive test suite located in the `tests/` directory.
+
+To run tests:
+```bash
+./tests/basic/test_api.sh           # Basic API functionality
+./tests/features/test_new_features.sh # Formats, filtering, keys
+./tests/features/test_cidr_and_pool.sh # CIDR ranges and concurrency
+./tests/ssl/test_ssl.sh             # SSL/TLS verification
+```
+
+See `tests/README.md` for more details on test coverage.
 
 ## Deployment
 
@@ -232,39 +243,6 @@ docker run -d -p 8080:8080 -v $(pwd)/config.json:/app/config.json ssh-monitor
 ### GitHub Actions
 
 The repository includes a GitHub Action for automated deployment to your VPS on every push to the `main` branch.
-
-#### Setting up GitHub Secrets
-
-To use the deployment workflow, you must add the following secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
-
-1.  `VPS_HOST`: The IP address or hostname of your VPS (e.g., `vps03.example.com`).
-2.  `VPS_USERNAME`: The SSH username used to log in (e.g., `root`).
-3.  `SSH_PRIVATE_KEY`: Your SSH private key. 
-    *   Generate a new key pair on your local machine if you don't have one: `ssh-keygen -t ed25519 -C "github-actions"`
-    *   Add the **public key** (`id_ed25519.pub`) to `~/.ssh/authorized_keys` on your VPS.
-    *   Paste the **private key** (`id_ed25519`) content into this GitHub secret.
-
-### Initial VPS Setup via GitHub Actions
-
-If you are deploying to a fresh VPS, you can use the manual "setup" workflow to prepare the environment:
-
-1. Go to the **Actions** tab in your GitHub repository.
-2. Select the **Deploy to VPS** workflow on the left.
-3. Click the **Run workflow** dropdown and select the branch (usually `main`).
-4. Click **Run workflow**.
-
-This manual action will:
-- Create `/opt/ssh-monitor` on your VPS.
-- Build and upload the `ssh-monitor` binary.
-- Initialize `config.json` (from sample) if it doesn't already exist.
-- Install and link the `ssh-monitor.service`.
-- Reload systemd and start the service.
-
-Once the initial setup is complete, subsequent pushes to the `main` branch will automatically update the binary and restart the service.
-
-#### Notes on SSH Setup
-- Ensure the user specified in `VPS_USERNAME` has `sudo` privileges without a password for `systemctl` commands if you want the service restart to work automatically.
-- Alternatively, you can adjust the `.github/workflows/deploy.yml` to match your specific server permissions.
 
 ## Python
 

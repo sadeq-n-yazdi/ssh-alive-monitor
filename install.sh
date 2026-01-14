@@ -2,6 +2,11 @@
 
 # SSH Alive Monitor Install Script
 
+# Get absolute path to project root (this script is in root)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR="$SCRIPT_DIR"
+WEBSERVER_DIR="$ROOT_DIR/webserver"
+
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root" 
    exit 1
@@ -11,13 +16,13 @@ INSTALL_DIR="/opt/ssh-monitor"
 mkdir -p $INSTALL_DIR
 
 echo "Building ssh-monitor..."
-cd webserver
+cd "$WEBSERVER_DIR"
 go build -o ssh-monitor .
 
 echo "Installing files..."
-cp ssh-monitor $INSTALL_DIR/
-cp generate_key.sh $INSTALL_DIR/
-chmod +x $INSTALL_DIR/generate_key.sh
+cp ssh-monitor "$INSTALL_DIR/"
+cp generate_key.sh "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/generate_key.sh"
 cp ssh-monitor.service /etc/systemd/system/
 
 # Create default config if not exists
