@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"sync"
+	"time"
 )
 
 type APIKeyType string
@@ -10,6 +11,8 @@ type APIKeyType string
 const (
 	KeyMaster APIKeyType = "master"
 	KeyNormal APIKeyType = "normal"
+
+	AuthCookieName = "ssh_monitor_auth"
 )
 
 type APIKey struct {
@@ -44,6 +47,54 @@ func (am *AuthManager) Authenticate(key string) (APIKey, bool) {
 		return APIKey{}, false
 	}
 	return apiKey, true
+}
+
+func (am *AuthManager) GetAuthFromRequest(r *http.Request) (APIKey, bool) {
+	// 1. Check Cookie
+	if cookie, err := r.Cookie(AuthCookieName); err == nil {
+		if key, ok := am.Authenticate(cookie.Value); ok {
+			return key, true
+		}
+	}
+
+	// 2. Check Header
+	key := r.Header.Get("X-API-Key")
+	if key != "" {
+		if apiKey, ok := am.Authenticate(key); ok {
+			return apiKey, true
+		}
+	}
+
+	// 3. Check Basic Auth
+	if _, password, ok := r.BasicAuth(); ok {
+		if apiKey, ok := am.Authenticate(password); ok {
+			return apiKey, true
+		}
+	}
+
+	return APIKey{}, false
+}
+
+func (am *AuthManager) SetAuthCookie(w http.ResponseWriter, key string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     AuthCookieName,
+		Value:    key,
+		Path:     "/",
+		HttpOnly: true,
+		// Secure:   true, // Should be true if using SSL, but we support both
+		Expires: time.Now().Add(24 * time.Hour),
+	})
+}
+
+func (am *AuthManager) ClearAuthCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     AuthCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+	})
 }
 
 func (am *AuthManager) AddKey(key string, kType APIKeyType) {
@@ -81,26 +132,20 @@ func (am *AuthManager) SetEnabled(key string, enabled bool) {
 
 func (am *AuthManager) AuthMiddleware(next http.HandlerFunc, minType APIKeyType) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			// Try Basic Auth
-			_, password, ok := r.BasicAuth()
-			if ok {
-				key = password
-			}
-		}
+		apiKey, ok := am.GetAuthFromRequest(r)
 
-		if key == "" {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "Missing API Key", http.StatusUnauthorized)
-			return
-		}
-
-		apiKey, ok := am.Authenticate(key)
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "Invalid or disabled API Key", http.StatusUnauthorized)
+			http.Error(w, "Unauthorized: Invalid or missing credentials", http.StatusUnauthorized)
 			return
+		}
+
+		// If authenticated via Basic Auth (or any method really, but mainly Basic for browser), ensure cookie is set
+		// We can just set it every time or check if it's missing.
+		// For simplicity, let's set it if missing or different.
+		currentCookie, err := r.Cookie(AuthCookieName)
+		if err != nil || currentCookie.Value != apiKey.Key {
+			am.SetAuthCookie(w, apiKey.Key)
 		}
 
 		if minType == KeyMaster && apiKey.Type != KeyMaster {

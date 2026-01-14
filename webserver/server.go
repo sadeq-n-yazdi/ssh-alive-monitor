@@ -123,6 +123,7 @@ func main() {
 
 	// Form interface
 	mux.HandleFunc("/form/", s.auth.AuthMiddleware(s.handleForm, KeyNormal))
+	mux.HandleFunc("/logout", s.handleLogout)
 
 	port := flag.String("port", cfg.Port, "Port to listen on")
 	sslEnabled := flag.Bool("ssl-enabled", cfg.SSLEnabled, "Enable SSL/TLS")
@@ -380,6 +381,14 @@ func (s *Server) saveConfig() error {
 	return err
 }
 
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.auth.ClearAuthCookie(w)
+	// Force browser to clear Basic Auth credentials by sending 401 with a different realm?
+	// Or just same realm but 401.
+	w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+	http.Error(w, "Logged out", http.StatusUnauthorized)
+}
+
 func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("requests", "Admin task: %s %s", r.Method, r.URL.Path)
 	switch r.Method {
@@ -567,18 +576,7 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
-	authKey := r.Header.Get("X-API-Key")
-	if authKey == "" {
-		_, password, ok := r.BasicAuth()
-		if ok {
-			authKey = password
-		}
-	}
-
-	isAuthenticated := false
-	if authKey != "" {
-		_, isAuthenticated = s.auth.Authenticate(authKey)
-	}
+	_, isAuthenticated := s.auth.GetAuthFromRequest(r)
 
 	if !isAuthenticated {
 		isAuthenticated = s.isWhitelisted(r.RemoteAddr)
@@ -683,18 +681,7 @@ func (s *Server) isWhitelisted(remoteAddr string) bool {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	authKey := r.Header.Get("X-API-Key")
-	if authKey == "" {
-		_, password, ok := r.BasicAuth()
-		if ok {
-			authKey = password
-		}
-	}
-
-	isAuthenticated := false
-	if authKey != "" {
-		_, isAuthenticated = s.auth.Authenticate(authKey)
-	}
+	_, isAuthenticated := s.auth.GetAuthFromRequest(r)
 
 	if !isAuthenticated {
 		isAuthenticated = s.isWhitelisted(r.RemoteAddr)
@@ -762,7 +749,7 @@ func (s *Server) handleForm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprintf(w, "<html><head><title>Management</title><style>table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:8px;}</style></head><body>")
 	fmt.Fprintf(w, "<h1>Management Interface</h1>")
-	fmt.Fprintf(w, "<p><a href='/'>Back to Status</a></p>")
+	fmt.Fprintf(w, "<p><a href='/'>Back to Status</a> | <a href='/logout'>Logout</a></p>")
 
 	fmt.Fprintf(w, "<h2>Hosts</h2>")
 	fmt.Fprintf(w, "<table><tr><th>Host</th><th>Interval</th><th>Timeout</th><th>Type</th><th>Actions</th></tr>")
