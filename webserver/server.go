@@ -167,7 +167,7 @@ func main() {
 
 	if cfg.SSLEnabled {
 		logger.Info("requests", "SSL Enabled. Checking certificates...")
-		
+
 		// Check ACME
 		if cfg.ACMEEnabled {
 			// If certs don't exist, try to obtain them
@@ -198,7 +198,7 @@ func main() {
 				// Or simple: Start HTTP server logic just for the challenge duration if using `MyHTTPProvider`?
 				// But `srv` is configured for the app.
 				// Let's assume for HTTP-01, the user has a separate setup or we temporarily listen on HTTP.
-				
+
 				if cfg.ACMEChallenge == "http" {
 					logger.Info("requests", "Starting temporary HTTP server for ACME challenge...")
 					tempSrv := &http.Server{Addr: serverAddr, Handler: mux}
@@ -207,7 +207,7 @@ func main() {
 					// Wait a bit for server to be up
 					time.Sleep(1 * time.Second)
 				}
-				
+
 				if err := acmeMgr.ObtainCert(); err != nil {
 					logger.Error("requests", "Failed to obtain ACME certificate: %v", err)
 					// Fallback to self-signed?
