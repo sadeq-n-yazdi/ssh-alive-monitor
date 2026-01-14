@@ -56,7 +56,7 @@ func main() {
 	}
 
 	auth := NewAuthManager(cfg)
-	monitor := NewMonitor(logger, cfg.CheckPoolSize, cfg.MaxSubnetConcurrency)
+	monitor := NewMonitor(logger, cfg.CheckPoolSize, cfg.MaxSubnetConcurrency, cfg.HistoryLimit)
 
 	// Add predefined hosts from simple list
 	defaultInterval, _ := time.ParseDuration(cfg.DefaultInterval)
@@ -526,9 +526,16 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Check permissions for CIDR size
+			ones, bits := ipNet.Mask.Size()
+
+			// Enforce a maximum size for all users to prevent DoS (max /16 or 65536 hosts)
+			if bits-ones > 16 {
+				http.Error(w, "CIDR range is too large. Maximum allowed range size is /16.", http.StatusBadRequest)
+				return
+			}
+
 			apiKey, _ := s.auth.GetAuthFromRequest(r)
 			if apiKey.Type == KeyNormal {
-				ones, _ := ipNet.Mask.Size()
 				// For IPv4, /24 is 24 ones. Limit is range smaller than /24.
 				// "smaller than /24" -> means fewer addresses? OR "range smaller than /24" usually means /25, /26...
 				// Wait, "limited to range smaller than /24"
@@ -1006,8 +1013,21 @@ func expandCIDR(cidr string) ([]string, error) {
 	}
 
 	var ips []string
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); {
 		ips = append(ips, ip.String())
+		inc(ip)
+
+		// Check for wrap-around to avoid infinite loop on /0
+		isZero := true
+		for _, b := range ip {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+		if isZero {
+			break
+		}
 	}
 	return ips, nil
 }

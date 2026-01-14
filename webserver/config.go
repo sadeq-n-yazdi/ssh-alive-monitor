@@ -45,6 +45,7 @@ type Config struct {
 	DefaultTimeout       string       `json:"default_timeout"`
 	CheckPoolSize        int          `json:"check_pool_size"`
 	MaxSubnetConcurrency int          `json:"max_subnet_concurrency"`
+	HistoryLimit         int          `json:"history_limit"`
 	MasterKeys           []string     `json:"master_keys"`
 	NormalKeys           []string     `json:"normal_keys"`
 	PredefinedHosts      []string     `json:"predefined_hosts"`
@@ -98,6 +99,7 @@ func GetConfig() *Config {
 		DefaultTimeout:       "5s",
 		CheckPoolSize:        100,
 		MaxSubnetConcurrency: 2,
+		HistoryLimit:         1000,
 		MasterKeys:           []string{"master-key-123"},
 		SSLEnabled:           false,
 		CertPath:             "server.crt",

@@ -32,17 +32,21 @@ type Monitor struct {
 	TotalActive     int
 	PoolSize        int
 	SubnetLimit     int
+	HistoryLimit    int
 	mu              sync.RWMutex
 	logger          *Logger
 	stop            chan struct{}
 }
 
-func NewMonitor(logger *Logger, poolSize int, subnetLimit int) *Monitor {
+func NewMonitor(logger *Logger, poolSize int, subnetLimit int, historyLimit int) *Monitor {
 	if poolSize <= 0 {
 		poolSize = 100
 	}
 	if subnetLimit <= 0 {
 		subnetLimit = 2
+	}
+	if historyLimit <= 0 {
+		historyLimit = 1000
 	}
 	return &Monitor{
 		Hosts:           make(map[string]*HostStatus),
@@ -51,6 +55,7 @@ func NewMonitor(logger *Logger, poolSize int, subnetLimit int) *Monitor {
 		ActivePerSubnet: make(map[string]int),
 		PoolSize:        poolSize,
 		SubnetLimit:     subnetLimit,
+		HistoryLimit:    historyLimit,
 		logger:          logger,
 		stop:            make(chan struct{}),
 	}
@@ -111,28 +116,13 @@ func (m *Monitor) processPending() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// While we have capacity and pending jobs
-	// We need to iterate carefully because we might skip some jobs due to subnet limits
-	// but process others further down the queue?
-	// The requirement says "FIFO order".
-	// Strictly FIFO means if the head of the queue is blocked by subnet limit, we stop?
-	// OR "pool must serve FIFO order" usually means we process in arrival order.
-	// If head is blocked, strictly FIFO would block everyone.
-	// But "limited for number of parallel check for ip address" suggests we should skip blocked ones
-	// to allow others to run, otherwise one subnet could stall the whole system.
-	// A common interpretation of "Pool with FIFO" + "Rate Limit" is:
-	// Process queue in order. If item can run, run it. If not, re-queue or skip.
-	// Let's implement: Iterate queue, if runnable, run and remove. If not, keep.
-	// This respects FIFO for *runnable* jobs (i.e. we don't pick a later job for the SAME subnet before an earlier one).
-	// But it allows other subnets to proceed.
-
-	var remaining []*HostStatus
-	processedCount := 0
-
+	// Use in-place filtering to avoid reallocating 'remaining' slice
+	n := 0
 	for _, h := range m.PendingHosts {
 		// Global Limit
 		if m.TotalActive >= m.PoolSize {
-			remaining = append(remaining, h)
+			m.PendingHosts[n] = h
+			n++
 			continue
 		}
 
@@ -140,7 +130,8 @@ func (m *Monitor) processPending() {
 
 		// Subnet Limit
 		if m.ActivePerSubnet[subnet] >= m.SubnetLimit {
-			remaining = append(remaining, h)
+			m.PendingHosts[n] = h
+			n++
 			continue
 		}
 
@@ -153,14 +144,19 @@ func (m *Monitor) processPending() {
 		h.NextRun = time.Now().Add(h.Interval)
 
 		go m.executeCheck(h, subnet)
-		processedCount++
+		// Do not increment n, effectively removing this host from the pending slice.
 	}
 
-	// Optimization: If we didn't process anything, remaining is identical to m.PendingHosts.
-	// We can avoid allocation if we are careful, but for simplicity:
-	m.PendingHosts = remaining
+	// Trim the slice to the new length
+	// Clear pointers to removed elements to avoid memory leaks?
+	// Go's GC handles this if we overwrite or slice.
+	// To be safe and let GC collect the removed host pointers if needed (though they are still in m.Hosts map so it matters less)
+	// Just slicing is standard for this pattern.
+	for i := n; i < len(m.PendingHosts); i++ {
+		m.PendingHosts[i] = nil
+	}
+	m.PendingHosts = m.PendingHosts[:n]
 }
-
 func (m *Monitor) executeCheck(h *HostStatus, subnet string) {
 	status := checkHost(h.Host, h.Timeout)
 
@@ -173,12 +169,11 @@ func (m *Monitor) executeCheck(h *HostStatus, subnet string) {
 	m.mu.Lock()
 	h.LastRun = result.Time
 	m.History = append(m.History, result)
-	if len(m.History) > 1000 {
-		m.History = m.History[len(m.History)-1000:]
+	if len(m.History) > m.HistoryLimit {
+		m.History = m.History[len(m.History)-m.HistoryLimit:]
 	}
 
-	// Release limits
-	m.TotalActive--
+	// Release limits	m.TotalActive--
 	m.ActivePerSubnet[subnet]--
 	if m.ActivePerSubnet[subnet] == 0 {
 		delete(m.ActivePerSubnet, subnet)

@@ -79,5 +79,5 @@ fi
 echo "---------------------------------------------------"
 echo "Test completed. Killing server..."
 kill $SERVER_PID
-rm -f webserver/ssh-monitor
+rm -f ssh-monitor
 echo "Done."
