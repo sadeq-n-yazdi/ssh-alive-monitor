@@ -152,6 +152,7 @@ func main() {
 	mux.HandleFunc("/logout", s.handleLogout)
 
 	port := flag.String("port", cfg.Port, "Port to listen on")
+	listenAddress := flag.String("listen-address", cfg.ListenAddress, "IP address to listen on (empty: all addresses)")
 	sslEnabled := flag.Bool("ssl-enabled", cfg.SSLEnabled, "Enable SSL/TLS")
 	certPath := flag.String("cert-path", cfg.CertPath, "Path to SSL certificate")
 	keyPath := flag.String("key-path", cfg.KeyPath, "Path to SSL private key")
@@ -171,6 +172,7 @@ func main() {
 	if *port != "" {
 		cfg.Port = *port
 	}
+	cfg.ListenAddress = *listenAddress
 	cfg.SSLEnabled = *sslEnabled
 	if *certPath != "" {
 		cfg.CertPath = *certPath
@@ -185,7 +187,7 @@ func main() {
 		}
 	}
 
-	serverAddr := ":" + cfg.Port
+	serverAddr := cfg.listenAddr()
 	srv := &http.Server{
 		Addr:    serverAddr,
 		Handler: s.loggingMiddleware(mux),

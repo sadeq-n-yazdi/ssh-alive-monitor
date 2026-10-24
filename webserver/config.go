@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 )
 
@@ -44,6 +45,7 @@ type NetworkRangeConfig struct {
 
 type Config struct {
 	Port                 string               `json:"port"`
+	ListenAddress        string               `json:"listen_address"` // IP to bind; "" = all addresses
 	LogLevel             string               `json:"log_level"`
 	LogComponents        []string             `json:"log_components"`
 	LogColor             bool                 `json:"log_color"`
@@ -123,4 +125,10 @@ func GetConfig() *Config {
 	loadConfig("config-override.json", cfg)
 
 	return cfg
+}
+
+// listenAddr returns the address for http.Server. An empty ListenAddress
+// binds every address, as before this setting existed.
+func (c *Config) listenAddr() string {
+	return net.JoinHostPort(c.ListenAddress, c.Port)
 }
