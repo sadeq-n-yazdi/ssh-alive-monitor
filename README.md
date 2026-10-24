@@ -89,6 +89,7 @@ The server reads configuration from `config.json` and `override.json`.
 | Field | Description | Default |
 |-------|-------------|---------|
 | `port` | Port to listen on | `8080` |
+| `listen_address` | IP address to listen on, for example `127.0.0.1` behind a reverse proxy. Empty means all addresses. | `""` |
 | `log_level` | `debug`, `info`, `warning`, `error` | `info` |
 | `log_components` | `requests`, `response`, `checks` | all |
 | `log_format` | `text`, `json`, `color` | `color` |
