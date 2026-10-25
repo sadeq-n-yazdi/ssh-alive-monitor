@@ -1,0 +1,3 @@
+# Install as /etc/sudoers.d/ghdeploy (mode 0440). The empty "" allows the
+# script with no arguments only.
+ghdeploy ALL=(root) NOPASSWD: /usr/local/sbin/ssh-monitor-deploy ""
