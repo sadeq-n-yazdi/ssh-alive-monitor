@@ -1,0 +1,32 @@
+#!/bin/sh
+# ssh-monitor-deploy: install a new ssh-monitor binary.
+#
+# The GitHub deploy (user ghdeploy) runs:
+#   sudo /usr/local/sbin/ssh-monitor-deploy < ~/upload/ssh-monitor
+# The binary comes on stdin, so root never opens a path that ghdeploy
+# controls. The sudoers rule allows this script with no arguments only.
+set -eu
+umask 022
+
+dst=/opt/ssh-monitor/ssh-monitor
+new=$dst.new
+
+cat > "$new"
+if [ "$(head -c 4 "$new" | od -An -c | tr -d ' ')" != '177ELF' ]; then
+	rm -f "$new"
+	echo "ssh-monitor-deploy: the input is not an ELF binary" >&2
+	exit 1
+fi
+chmod 0755 "$new"
+cp -p "$dst" "$dst.prev"
+mv -f "$new" "$dst"
+
+systemctl restart ssh-monitor
+sleep 3
+if ! systemctl is-active --quiet ssh-monitor; then
+	echo "ssh-monitor-deploy: the service did not start; restoring ssh-monitor.prev" >&2
+	cp -p "$dst.prev" "$dst"
+	systemctl restart ssh-monitor
+	exit 1
+fi
+echo "ssh-monitor-deploy: ssh-monitor updated"

@@ -243,7 +243,29 @@ docker run -d -p 8080:8080 -v $(pwd)/config.json:/app/config.json ssh-monitor
 
 ### GitHub Actions
 
-The repository includes a GitHub Action for automated deployment to your VPS on every push to the `main` branch.
+The workflow `.github/workflows/deploy.yml` deploys the server to the VPS.
+It runs on each push to `main`, and you can also start it by hand. It builds
+the binary, copies it to `~/upload` of the deploy user, and runs
+`/usr/local/sbin/ssh-monitor-deploy`. That script keeps the old binary as
+`ssh-monitor.prev` and restarts the service. If the service does not start,
+the script puts the old binary back.
+
+The workflow uses these repository secrets: `VPS_HOST`, `VPS_PORT`,
+`VPS_USERNAME` and `SSH_PRIVATE_KEY`.
+
+To prepare a new VPS, do these steps as root:
+
+1. Create the deploy user, for example `useradd --system --create-home --shell /bin/bash ghdeploy`.
+2. Lock the password of the user with `passwd -l ghdeploy`.
+3. Make the directories `~/.ssh` and `~/upload` of the user, with mode 0700.
+4. Put the public key in `~/.ssh/authorized_keys`, with the `restrict` option at the start of the line.
+5. Install `deploy/ssh-monitor-deploy` as `/usr/local/sbin/ssh-monitor-deploy`, with owner root and mode 0755.
+6. Install `deploy/sudoers-ghdeploy` as `/etc/sudoers.d/ghdeploy`, with mode 0440. Check it first with `visudo -cf`.
+
+> [!CAUTION]
+> Do not give the deploy user other sudo rights. The service runs as root, so
+> the deploy key already controls root on the VPS through the binary. Keep
+> the key only in the repository secrets.
 
 ## Python
 
